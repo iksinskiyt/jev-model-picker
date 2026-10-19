@@ -158,7 +158,9 @@ build step. Two loading conventions exist:
   `./server` subpath from `exports`, which also points at `src/index.ts`.
 
 Config edits, and edits to the plugin's own files, hot-reload it in a running
-OpenCode server — no restart needed.
+OpenCode server — no restart needed. The exact loading mechanics (and how to
+run an isolated test server) are documented in
+[`docs/opencode-v2-plugin-loading.md`](docs/opencode-v2-plugin-loading.md).
 
 ## Roadmap
 
