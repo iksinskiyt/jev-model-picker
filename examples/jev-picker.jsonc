@@ -1,0 +1,42 @@
+// jev-model-picker — example wiring for OpenCode V2
+// Add to ~/.config/opencode/opencode.jsonc (or your project config).
+//
+// Works standalone; with oh-my-opencode-slim it reads the active preset's
+// lane pins as bias + fallback. See README for the full options reference.
+{
+  "plugins": [
+    "oh-my-opencode-slim",
+    {
+      "package": "file:///F:/code/jev-model-picker",
+      "options": {
+        "enabled": true,
+
+        // Default backend: keyless Jev on the OpenCode Zen gateway.
+        // Swap baseURL/model for the direct TypeSafe API (needs apiKeyEnv)
+        // or any other System One-compatible endpoint.
+        "systemone": {
+          "baseURL": "https://opencode.ai/inference/systemone/v1",
+          "model": "jev-1.13-free"
+        },
+
+        // Optional fallback decision model over an OpenAI-compatible chat
+        // endpoint — NVIDIA NIM, local llama.cpp, or any model that works
+        // the same way (openJEV, ...). Only used when systemone can't pick.
+        // "chat": {
+        //   "providerID": "nvidia",
+        //   "model": "z-ai/glm-5.3",
+        //   "jsonMode": true
+        // },
+
+        "tools": ["subagent", "task"],
+        "policy": {
+          "maxCandidates": 12,
+          "respectExplicitModel": true,
+          "timeoutMs": 6000
+        },
+        "digest": { "maxChars": 1200 },
+        "logDecisions": true
+      }
+    }
+  ]
+}

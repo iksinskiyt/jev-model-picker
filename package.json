@@ -1,0 +1,49 @@
+{
+  "name": "jev-model-picker",
+  "version": "0.1.0",
+  "description": "Jev-powered model picker for OpenCode V2 — a System One decision model picks the best model for every delegated task, transparently.",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "prompts",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "probe": "bun run scripts/probe.ts"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "opencode-v2",
+    "jev",
+    "typesafe",
+    "model-picker",
+    "model-router",
+    "agent-orchestration",
+    "llm"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@opencode/plugin": "^2.0.32"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.2"
+  },
+  "peerDependencies": {
+    "oh-my-opencode-slim": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "oh-my-opencode-slim": {
+      "optional": true
+    }
+  }
+}
