@@ -74,6 +74,8 @@ export interface Candidate {
   name?: string;
   /** Human/LLM readable description used as choice criteria for the picker. */
   description: string;
+  /** Blended USD per million tokens ((input+output)/2). 0 for free models. */
+  pricePerMTok: number;
 }
 
 export interface PickResult {

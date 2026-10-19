@@ -11,6 +11,7 @@
   },
   "files": [
     "src",
+    "tui.ts",
     "prompts",
     "examples",
     "README.md",

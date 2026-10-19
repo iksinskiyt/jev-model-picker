@@ -1,4 +1,5 @@
 import type { PickerRuntime } from "./pick";
+import { recordDecisionToBridge } from "./bridge";
 
 /**
  * Transparent model injection: intercept delegation tool calls before they
@@ -33,22 +34,6 @@ export function matchesTool(name: string, configured: string[]): boolean {
     const wanted = candidate.toLowerCase();
     return lowered === wanted || lowered.endsWith(`/${wanted}`);
   });
-}
-
-/**
- * Persist a pick so the TUI (and any later reader) can render probability
- * bars for it. Best-effort: storage failures never break a delegation.
- */
-export async function recordDecision(ctx: any, decision: any): Promise<void> {
-  try {
-    if (!ctx?.storage?.set) return;
-    await ctx.storage.set(
-      `jev-decisions/${decision.sessionID}/${decision.callID}`,
-      JSON.stringify(decision),
-    );
-  } catch {
-    // logging is best-effort
-  }
 }
 
 export async function registerDelegationHook(
@@ -86,19 +71,22 @@ export async function registerDelegationHook(
       // …and replace the input for hosts that swap the object.
       event.input = { ...input, model: pick.ref };
 
-      await recordDecision(ctx, {
-        sessionID: event?.sessionID ?? "",
-        messageID: event?.messageID ?? "",
-        callID: event?.id ?? "",
+      // Bridge record: probability + price ratio vs the lane's default model,
+      // consumed by the TUI to render probability bars and savings.
+      const defaultModel = runtime.lanePin(lane) ?? (input.model as string | undefined);
+      const ratio = await runtime.priceRatio(pick.ref, defaultModel);
+      recordDecisionToBridge({
         ts: Date.now(),
+        sessionID: String(event?.sessionID ?? ""),
         model: pick.ref,
-        probability: pick.probability,
-        margin: pick.margin,
-        reason: pick.reason,
-        backend: pick.backend,
+        defaultModel,
+        probability: pick.probability ?? 0,
+        margin: pick.margin ?? 0,
+        reason: pick.reason ?? "",
+        backend: pick.backend ?? "",
         lane: lane ?? "",
         task,
-        costDelta: pick.costDelta ?? 0,
+        ratio,
       });
     } catch {
       // never break a delegation

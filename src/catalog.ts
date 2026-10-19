@@ -3,6 +3,21 @@ import type { Candidate, PickerConfig } from "./types";
 const EXCLUDE_ID = /(embed|rerank|guard|safety|moderation)/i;
 
 /**
+ * Blended USD per million output-equivalent tokens: mean of input and output
+ * price, ignoring cache pricing. Multiple tiers (context sizes) take the last
+ * one's read/write cache prices into account only for the mean's input half.
+ * A model with no priced tiers is free (0).
+ */
+export function blendedPrice(costArr: readonly any[]): number {
+  const tier = costArr[0];
+  if (!tier) return 0;
+  const input = Number(tier?.input ?? 0);
+  const output = Number(tier?.output ?? 0);
+  if (!Number.isFinite(input) || !Number.isFinite(output)) return 0;
+  return (input + output) / 2;
+}
+
+/**
  * Build the candidate list offered to the picker for a given lane.
  *
  * - Auto: every enabled, tool-capable model from ctx.model.list()
@@ -15,6 +30,7 @@ export async function listCandidates(
   cfg: PickerConfig,
   lane?: string,
   lanePin?: string,
+  allowlist?: string[],
 ): Promise<Candidate[]> {
   let models: any[] = [];
   try {
@@ -53,6 +69,7 @@ export async function listCandidates(
     const paid = costArr.some(
       (c) => Number(c?.input ?? 0) > 0 || Number(c?.output ?? 0) > 0,
     );
+    const pricePerMTok = blendedPrice(costArr);
     const context = Number(m.limit?.context ?? 0);
     const name = String(m.name ?? id);
 
@@ -60,11 +77,11 @@ export async function listCandidates(
     if (context > 0) parts.push(`${Math.round(context / 1000)}K ctx`);
     const description = cfg.descriptions[ref] ?? parts.join(", ");
 
-    all.push({ ref, providerID, id, name, description });
+    all.push({ ref, providerID, id, name, description, pricePerMTok });
   }
 
   const explicit = lane ? cfg.lanes[lane] : undefined;
-  let list: Candidate[] = all;
+  let list = filterAllowlist(all, allowlist);
 
   if (explicit && explicit.length > 0) {
     // explicit config wins; if it resolves to fewer than 2 live refs the
@@ -84,4 +101,14 @@ export async function listCandidates(
 
   const max = Math.max(2, cfg.policy.maxCandidates);
   return list.slice(0, max);
+}
+
+/** TUI-set allow-list restricts the candidate set; empty/undefined keeps all. */
+function filterAllowlist(
+  all: Candidate[],
+  allowlist?: string[],
+): Candidate[] {
+  if (!allowlist || allowlist.length === 0) return all;
+  const wanted = new Set(allowlist);
+  return all.filter((c) => wanted.has(c.ref));
 }

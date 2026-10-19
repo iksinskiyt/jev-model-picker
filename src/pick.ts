@@ -13,6 +13,7 @@ import { listCandidates } from "./catalog";
 import { loadOmoslim } from "./omoslim";
 import { logDecision } from "./log";
 import { resolveProviderKey } from "./creds";
+import { readBridge } from "./bridge";
 
 export function buildQuestions(
   candidates: Candidate[],
@@ -77,8 +78,40 @@ export class PickerRuntime {
     return this.laneMap()?.[lane]?.model;
   }
 
-  async candidatesFor(lane?: string): Promise<Candidate[]> {
-    return listCandidates(this.ctx, this.cfg, lane, this.lanePin(lane));
+  async candidatesFor(
+    lane?: string,
+    allowlist?: string[],
+  ): Promise<Candidate[]> {
+    return listCandidates(
+      this.ctx,
+      this.cfg,
+      lane,
+      this.lanePin(lane),
+      allowlist,
+    );
+  }
+
+  /**
+   * picked price / default price (blended USD per MTok). 1 when either side
+   * is missing or both are free; >1 when the pick is pricier than default.
+   */
+  async priceRatio(
+    pickedRef: string,
+    defaultRef?: string,
+  ): Promise<number> {
+    try {
+      const candidates = await this.candidatesFor();
+      const byRef = new Map(candidates.map((c) => [c.ref, c.pricePerMTok]));
+      const picked = byRef.get(pickedRef);
+      const fallback = defaultRef ? byRef.get(defaultRef) : undefined;
+      if (picked === undefined) return 1;
+      if (fallback === undefined || fallback <= 0) {
+        return fallback === 0 ? 0 : 1;
+      }
+      return picked / fallback;
+    } catch {
+      return 1;
+    }
   }
 
   async recentDecisions(limit = 10): Promise<unknown[]> {
@@ -109,6 +142,18 @@ export class PickerRuntime {
     const cfg = this.cfg;
     if (!cfg.enabled) return undefined;
 
+    // Bridge state: the TUI can toggle assistance off, restrict candidates,
+    // and link a hosted/local decision backend.
+    const bridge = readBridge();
+    if (!bridge.enabled) return undefined;
+    const settings = bridge.settings ?? {};
+    const allowlist = Array.isArray(settings.allowlist)
+      ? (settings.allowlist as string[]).filter((r) => typeof r === "string")
+      : undefined;
+    const linked = settings.backend as
+      | { baseURL?: string; apiKey?: string; model?: string }
+      | undefined;
+
     const digest = digestTask(taskText, cfg.digest.maxChars);
     if (!digest || digest.length < 16) return undefined;
 
@@ -121,10 +166,14 @@ export class PickerRuntime {
     const errors: string[] = [];
 
     try {
-      candidates = await this.candidatesFor(lane);
+      candidates = await this.candidatesFor(
+        lane,
+        allowlist && allowlist.length ? allowlist : undefined,
+      );
       if (candidates.length >= 2) {
         const questions = buildQuestions(candidates, lane);
-        for (const backend of cfg.backends) {
+        const backends = this.backends(linked);
+        for (const backend of backends) {
           const startedAt = Date.now();
           try {
             let attempt: PickResult | undefined;
@@ -167,6 +216,28 @@ export class PickerRuntime {
       error: pick ? undefined : errors.join(" | ") || undefined,
     });
     return pick;
+  }
+
+  /**
+   * Configured backends, with a TUI-linked backend taking the lead when one
+   * is set (hosted URL or a local openJEV endpoint).
+   */
+  private backends(
+    linked?: { baseURL?: string; apiKey?: string; model?: string },
+  ): (typeof this.cfg.backends)[number][] {
+    const configured = [...this.cfg.backends];
+    const baseURL = linked?.baseURL?.trim();
+    if (!baseURL) return configured;
+    const chatBackend: ChatBackendConfig = {
+      kind: "chat",
+      baseURL,
+      model: linked?.model?.trim() || this.cfg.backends[0]?.model || "jev-1.13-free",
+      apiKey: linked?.apiKey?.trim() || undefined,
+      timeoutMs: this.cfg.backends[0]?.timeoutMs ?? 6000,
+      maxTokens: 2048,
+      jsonMode: true,
+    };
+    return [chatBackend, ...configured];
   }
 
   private async resolveChat(
