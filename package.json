@@ -7,7 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./server": "./src/index.ts",
-    "./tui": "./src/tui/index.ts"
+    "./tui": "./src/tui/index.tsx"
   },
   "files": [
     "src",
@@ -38,13 +38,28 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0",
     "typescript": "^5.9.2"
   },
   "peerDependencies": {
-    "oh-my-opencode-slim": ">=3.0.0"
+    "oh-my-opencode-slim": ">=3.0.0",
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {
     "oh-my-opencode-slim": {
+      "optional": true
+    },
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
       "optional": true
     }
   }

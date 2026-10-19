@@ -10,7 +10,9 @@
     "resolveJsonModule": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid",
     "types": ["node"]
   },
-  "include": ["src", "scripts", "server.ts"]
+  "include": ["src", "scripts", "server.ts", "tui.ts"]
 }
