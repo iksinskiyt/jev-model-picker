@@ -92,26 +92,36 @@ export class PickerRuntime {
   }
 
   /**
-   * picked price / default price (blended USD per MTok). 1 when either side
-   * is missing or both are free; >1 when the pick is pricier than default.
+   * Blended USD per MTok for two refs, from the live model catalog.
+   * Missing/default-free models resolve to 0 (free).
    */
+  async pricesFor(
+    pickedRef: string,
+    defaultRef?: string,
+  ): Promise<{ picked: number; def: number }> {
+    try {
+      const candidates = await this.candidatesFor();
+      const byRef = new Map(candidates.map((c) => [c.ref, c.pricePerMTok]));
+      const picked = byRef.get(pickedRef) ?? 0;
+      const fallback = defaultRef ? (byRef.get(defaultRef) ?? 0) : 0;
+      return {
+        picked: Number.isFinite(picked) ? picked : 0,
+        def: Number.isFinite(fallback) ? fallback : 0,
+      };
+    } catch {
+      return { picked: 0, def: 0 };
+    }
+  }
+
+  /** picked price / default price. Kept for the transcript footer summary. */
   async priceRatio(
     pickedRef: string,
     defaultRef?: string,
   ): Promise<number> {
-    try {
-      const candidates = await this.candidatesFor();
-      const byRef = new Map(candidates.map((c) => [c.ref, c.pricePerMTok]));
-      const picked = byRef.get(pickedRef);
-      const fallback = defaultRef ? byRef.get(defaultRef) : undefined;
-      if (picked === undefined) return 1;
-      if (fallback === undefined || fallback <= 0) {
-        return fallback === 0 ? 0 : 1;
-      }
-      return picked / fallback;
-    } catch {
-      return 1;
-    }
+    const { picked, def } = await this.pricesFor(pickedRef, defaultRef);
+    if (def <= 0) return 1;
+    if (picked <= 0) return 0;
+    return picked / def;
   }
 
   async recentDecisions(limit = 10): Promise<unknown[]> {

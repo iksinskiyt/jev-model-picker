@@ -96,9 +96,10 @@ export async function registerDelegationHook(
       // …and replace the input for hosts that swap the object.
       event.input = { ...input, model: pick.ref };
 
-      // Bridge record: probability + price ratio vs the lane's default model.
+      // Bridge record: probability + prompt + prices for savings accounting.
       const defaultModel = runtime.lanePin(lane) ?? undefined;
       const ratio = await runtime.priceRatio(pick.ref, defaultModel);
+      const { picked, def } = await runtime.pricesFor(pick.ref, defaultModel);
       recordDecisionToBridge({
         ts: Date.now(),
         sessionID: String(event?.sessionID ?? ""),
@@ -110,7 +111,8 @@ export async function registerDelegationHook(
         backend: pick.backend ?? "",
         lane: lane ?? "",
         task,
-        ratio,
+        pickedPrice: picked,
+        defaultPrice: def,
       });
 
       // Keep the bar for the after-hook so it lands in session history.

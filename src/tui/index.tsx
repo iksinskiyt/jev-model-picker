@@ -3,29 +3,34 @@ import { Plugin } from "@opencode/plugin/tui"
 import type { Context, PanelInput } from "@opencode/plugin/tui/context"
 import { createSignal, For, Show, onCleanup, onMount } from "solid-js"
 import { TextAttributes } from "@opentui/core"
-import { bridgeFile, readBridge, writeBridge } from "../bridge"
+import { counterfactualGain, readBridge, writeBridge } from "../bridge"
 import type { BridgeDecision, BridgeState } from "../bridge"
-import { existsSync, statSync } from "node:fs"
 
 /**
  * TUI surface for jev-model-picker.
  *
- * Probability bars live in the session transcript (the server appends them to
- * each delegated tool result — see src/hook.ts). This plugin renders:
- * - a clickable right-sidebar occupancy block: a JEV ON/OFF button, the last
- *   pick, and a click-anywhere-open history action,
- * - the history as message-like blocks (same SplitBorder look as session
- *   messages) in a session panel and a route page,
- * - palette commands: toggle, model allow-list picker (paged), backend linker.
+ * Where things render:
+ * - session transcript: the probability bar footer (server-side, src/hook.ts)
+ * - right sidebar: a compact occupancy block — a JEV ON/OFF button, the last
+ *   delegated prompt, and the money saved
+ * - session panel (right side of a session): status only — is JEV working,
+ *   did the last pick work, and the last prompt (no bars, no model list)
+ * - history subscreen (route): every decision as a transcript-like block with
+ *   the prompt, the bar, and the model; esc returns to the session
+ *
+ * Savings are computed from real usage: per family, token deltas are priced
+ * at the lane's default model and the actual cost delta subtracted.
  */
 
 const PLUGIN_ID = "jev-model-picker"
 const PANEL_NAME = `${PLUGIN_ID}.history`
-const SAVINGS_POLL_MS = 1500
+const SAVINGS_POLL_MS = 2000
 const BRIDGE_WRITE_DEBOUNCE_MS = 2000
+const ATTRIBUTION_WINDOW_MS = 30 * 60 * 1000
 const MINI_BAR_WIDTH = 10
 const HISTORY_BAR_WIDTH = 24
 const PICKER_PAGE_ROWS = 11
+const PROMPT_MAX_CHARS = 240
 
 function bar(fraction: number, width: number): string {
   const value = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 0
@@ -33,7 +38,7 @@ function bar(fraction: number, width: number): string {
   return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled))
 }
 
-// Same left-rail the session transcript uses for message blocks.
+// Same left rail the session transcript uses for message blocks.
 const SplitBorder = {
   border: ["left" as const],
   customBorderChars: {
@@ -53,6 +58,11 @@ const SplitBorder = {
 
 function shortRef(ref: string, width = 26): string {
   return ref.length > width ? `…${ref.slice(-(width - 1))}` : ref.padEnd(width)
+}
+
+function clipText(text: string, max: number): string {
+  const clean = text.replace(/\s+/g, " ").trim()
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean
 }
 
 type Price = { ref: string; provider: string; pricePerMTok: number }
@@ -76,45 +86,39 @@ function priceLabel(price: number): string {
   return `$${price.toFixed(2)}/MTok`
 }
 
-/** Clickable terminal button; ignores drags that select text. */
-function Button(props: { label: string; onClick: () => void; children?: any }) {
-  const theme = useThemeSafe()
+let pluginCtx: Context
+
+/** Click target guard: ignore mouse-ups that end a text selection. */
+function isSelecting(): boolean {
+  try {
+    return Boolean(pluginCtx?.renderer?.getSelection?.()?.getSelectedText?.())
+  } catch {
+    return false
+  }
+}
+
+/** Clickable terminal button with hover feedback. */
+function Button(props: { label: string; onClick: () => void }) {
   const [hovered, setHovered] = createSignal(false)
+  const theme = pluginCtx?.theme
   return (
     <box
       height={1}
       paddingLeft={1}
       paddingRight={1}
-      backgroundColor={hovered() ? theme.hovered : undefined}
+      backgroundColor={hovered() ? theme?.background?.action?.primary?.hovered : undefined}
       onMouseOver={() => setHovered(true)}
       onMouseOut={() => setHovered(false)}
       onMouseUp={() => {
-        const selection = ctxRendererSelection()
-        if (selection) return
+        if (isSelecting()) return
         props.onClick()
       }}
     >
-      <text fg={theme.base} attributes={TextAttributes.BOLD}>
+      <text fg={theme?.text?.base} attributes={TextAttributes.BOLD}>
         {props.label}
       </text>
     </box>
   )
-}
-
-let pluginCtx: Context
-function ctxRendererSelection(): string | undefined {
-  try {
-    return pluginCtx?.renderer?.getSelection?.()?.getSelectedText?.() || undefined
-  } catch {
-    return undefined
-  }
-}
-function useThemeSafe() {
-  const theme = pluginCtx?.theme
-  return {
-    base: theme?.text?.base,
-    hovered: theme?.background?.action?.primary?.hovered ?? theme?.hue?.accent?.[300],
-  }
 }
 
 export default Plugin.define({
@@ -127,23 +131,35 @@ export default Plugin.define({
     // ---------------------------------------------------------------- state
 
     let bridge: BridgeState = readBridge()
-    let lastMtime = 0
-    try {
-      if (existsSync(bridgeFile())) lastMtime = statSync(bridgeFile()).mtimeMs
-    } catch {
-      lastMtime = 0
-    }
+    const savedByTs = new Map<number, number>()
 
     const [version, setVersion] = createSignal(0)
     const bump = () => setVersion((v) => v + 1)
 
     const refresh = () => {
       try {
-        const file = bridgeFile()
-        if (!existsSync(file)) return
-        const mtime = statSync(file).mtimeMs
-        if (mtime === lastMtime) return
-        lastMtime = mtime
+        const fresh = readBridge()
+        if (fresh.rev === bridge.rev) return
+        bridge = fresh
+        bump()
+      } catch {
+        // ignore
+      }
+    }
+
+    /**
+     * Merge our accumulated state onto the latest file contents (the server
+     * may have appended decisions meanwhile) and write atomically.
+     */
+    const commit = (patch?: (state: BridgeState) => void) => {
+      try {
+        const fresh = readBridge()
+        patch?.(fresh)
+        for (const decision of fresh.decisions) {
+          const saved = savedByTs.get(decision.ts)
+          if (saved !== undefined) decision.saved = saved
+        }
+        writeBridge(fresh)
         bridge = readBridge()
         bump()
       } catch {
@@ -151,67 +167,116 @@ export default Plugin.define({
       }
     }
 
-    const persist = () => {
+    // --------------------------------------------------- savings accounting
+
+    /**
+     * Counterfactual savings: the tokens a family burned since the last
+     * measurement are priced at the lane's DEFAULT model; the cost the family
+     * actually paid (already on JEV's pick) is subtracted. Works for free
+     * picks too, where the observed cost is ~0 but tokens are real.
+     */
+    type FamilyUsage = { tokens: number; cost: number }
+    const familyUsage = new Map<string, FamilyUsage>()
+
+    const tokensFor = async (rootID: string): Promise<number> => {
+      let ids: string[] = []
       try {
-        writeBridge(bridge)
-        if (existsSync(bridgeFile())) lastMtime = statSync(bridgeFile()).mtimeMs
+        ids = data.session.family(rootID)
       } catch {
-        // ignore
+        return 0
       }
+      await Promise.all(
+        ids.map((id) =>
+          Promise.resolve(data.session.message.sync(id)).catch(() => undefined),
+        ),
+      )
+      let total = 0
+      for (const id of ids) {
+        for (const message of data.session.message.list(id) ?? []) {
+          const tokens = (message as any)?.tokens
+          if (!tokens) continue
+          total +=
+            Number(tokens.input ?? 0) +
+            Number(tokens.output ?? 0) +
+            Number(tokens.reasoning ?? 0)
+        }
+      }
+      return total
     }
 
-    // -------------------------------------------------- savings attribution
-
-    const baselines = new Map<number, number>()
-    const attributeCosts = () => {
-      let changed = false
+    const attribute = async () => {
+      // Latest still-relevant decision per root family gets the credit.
+      const latest = new Map<string, BridgeDecision>()
+      const now = Date.now()
       for (const decision of bridge.decisions) {
         if (!decision.sessionID) continue
-        let current: number | undefined
+        if (now - decision.ts > ATTRIBUTION_WINDOW_MS) continue
+        let root: string
         try {
-          current = data.session.cost(decision.sessionID)
+          root = data.session.root(decision.sessionID)
         } catch {
           continue
         }
-        if (current === undefined) continue
-        const previous = baselines.get(decision.ts)
-        if (previous === undefined) {
-          baselines.set(decision.ts, current)
+        const held = latest.get(root)
+        if (!held || decision.ts > held.ts) latest.set(root, decision)
+      }
+      let changed = false
+      for (const [root, decision] of latest) {
+        let cost = 0
+        try {
+          cost = data.session.cost(root) ?? 0
+        } catch {
           continue
         }
-        const delta = current - previous
-        if (delta > 0) {
-          const ratio = Number.isFinite(decision.ratio) ? decision.ratio : 1
-          decision.saved = (decision.saved ?? 0) + delta * (1 - ratio)
-          baselines.set(decision.ts, current)
-          changed = true
-        }
+        const tokens = await tokensFor(root)
+        const previous = familyUsage.get(root) ?? { tokens, cost }
+        familyUsage.set(root, { tokens, cost })
+        const gain = counterfactualGain(
+          tokens - previous.tokens,
+          decision.defaultPrice ?? 0,
+          cost - previous.cost,
+        )
+        if (gain <= 0) continue
+        // Accumulate by timestamp so concurrent server writes (which rewrite
+        // the file) never lose an attributed delta.
+        savedByTs.set(decision.ts, (savedByTs.get(decision.ts) ?? 0) + gain)
+        changed = true
       }
       return changed
     }
 
     let lastWrite = 0
-    const poll = () => {
+    let attributing = false
+    const poll = async () => {
       refresh()
-      if (attributeCosts() && Date.now() - lastWrite > BRIDGE_WRITE_DEBOUNCE_MS) {
-        lastWrite = Date.now()
-        persist()
-        bump()
+      if (attributing) return
+      attributing = true
+      try {
+        const changed = await attribute()
+        if (changed && Date.now() - lastWrite > BRIDGE_WRITE_DEBOUNCE_MS) {
+          lastWrite = Date.now()
+          commit()
+        }
+      } finally {
+        attributing = false
       }
     }
 
     onMount(() => {
-      const timer = setInterval(poll, SAVINGS_POLL_MS)
+      const timer = setInterval(() => void poll(), SAVINGS_POLL_MS)
       onCleanup(() => clearInterval(timer))
     })
 
     // ------------------------------------------------------------- commands
 
+    const savedOf = (d: BridgeDecision) => savedByTs.get(d.ts) ?? d.saved ?? 0
+    const savedTotal = () =>
+      bridge.decisions.reduce((sum: number, d: BridgeDecision) => sum + savedOf(d), 0)
+
     const toggleEnabled = () => {
-      bridge = readBridge()
-      bridge.enabled = !bridge.enabled
-      persist()
-      bump()
+      commit((state) => {
+        state.enabled = !state.enabled
+      })
       ui.toast.show({
         title: "JEV",
         message: bridge.enabled ? "assistance ON" : "assistance OFF",
@@ -220,13 +285,18 @@ export default Plugin.define({
     }
 
     const openHistory = () => {
+      ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
+    }
+
+    /** Sidebar click: the status panel in-session, else the history route. */
+    const openPanel = () => {
       const route = ui.router.current()
       if (route.type !== "session") {
-        ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
+        openHistory()
         return
       }
       const opened = ui.panel.open(PANEL_NAME)
-      if (!opened) ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
+      if (!opened) openHistory()
     }
 
     const commands = () => [
@@ -256,20 +326,18 @@ export default Plugin.define({
             const raw = (readBridge().settings?.allowlist as string[] | undefined) ?? []
             return raw.length ? new Set(raw) : new Set(prices.map((p) => p.ref))
           }
-          // Standard dialog size, with the picker's own paging inside it.
           ui.dialog.set({ size: "medium" })
           ui.dialog.show(() => (
             <ModelPicker
               models={prices}
               selected={allow()}
               onDone={(next) => {
-                bridge = readBridge()
-                bridge.settings = {
-                  ...bridge.settings,
-                  allowlist: next.size === prices.length ? [] : [...next],
-                }
-                persist()
-                bump()
+                commit((state) => {
+                  state.settings = {
+                    ...state.settings,
+                    allowlist: next.size === prices.length ? [] : [...next],
+                  }
+                })
                 ui.dialog.clear()
                 ui.toast.show({
                   title: "JEV",
@@ -305,23 +373,22 @@ export default Plugin.define({
             title: "Backend model (optional)",
             placeholder: "jev-1.13-free",
           })
-          bridge = readBridge()
-          bridge.settings = {
-            ...bridge.settings,
-            backend: {
-              baseURL,
-              apiKey: apiKey?.trim() || undefined,
-              model: model?.trim() || undefined,
-            },
-          }
-          persist()
-          bump()
+          commit((state) => {
+            state.settings = {
+              ...state.settings,
+              backend: {
+                baseURL,
+                apiKey: apiKey?.trim() || undefined,
+                model: model?.trim() || undefined,
+              },
+            }
+          })
           ui.toast.show({ title: "JEV", message: `backend linked: ${baseURL}`, variant: "success" })
         },
       },
       {
-        id: `${PLUGIN_ID}.panel`,
-        title: "JEV: decision history (panel)",
+        id: `${PLUGIN_ID}.history`,
+        title: "JEV: decision history",
         group: "JEV",
         palette: true as const,
         slash: { name: "jev-history" },
@@ -337,20 +404,8 @@ export default Plugin.define({
 
     // -------------------------------------------------------------- sidebar
 
-    const savedTotal = () =>
-      bridge.decisions.reduce((sum: number, d: BridgeDecision) => sum + (d.saved ?? 0), 0)
-
-    const HistoryPanel = (props: { panel?: PanelInput }) => (
-      <box flexDirection="column" gap={1}>
-        <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
-          {`JEV history · saved $${savedTotal().toFixed(4)}`}
-        </text>
-        {historyBody()}
-      </box>
-    )
-
-    // Right sidebar: occupancy only — a toggle button, the last pick, and the
-    // whole block opens the history on click.
+    // Right sidebar: compact occupancy — toggle button, last prompt (click
+    // opens the history subscreen), and the money saved.
     ui.slot({
       append: "sidebar.content",
       render: () => {
@@ -362,28 +417,28 @@ export default Plugin.define({
         const last = bridge.decisions[0]
         const saved = savedTotal()
         return (
-          <box flexDirection="column" gap={0}>
-            <Button
-              label={` JEV ${bridge.enabled ? "ON" : "OFF"} ▸ `}
-              onClick={toggleEnabled}
-            />
+          <box flexDirection="column" padding={1} gap={1}>
+            <Button label={` JEV ${bridge.enabled ? "ON" : "OFF"} ▸ `} onClick={toggleEnabled} />
             <box
               flexDirection="column"
               onMouseUp={() => {
-                if (ctxRendererSelection()) return
-                openHistory()
+                if (isSelecting()) return
+                openPanel()
               }}
             >
               <Show when={last} fallback={<text fg={muted}>waiting for a delegated task</text>}>
                 {(pick: () => BridgeDecision) => (
                   <>
-                    <text fg={base}>
-                      {`${shortRef(pick().model, 18)} ${(pick().probability * 100).toFixed(0)}% ${bar(
+                    <text fg={muted}>last prompt</text>
+                    <text fg={base} wrapMode="word">
+                      {clipText(pick().task, 120)}
+                    </text>
+                    <text fg={muted}>
+                      {`${pick().lane || "task"} · ${(pick().probability * 100).toFixed(0)}% ${bar(
                         pick().probability,
                         MINI_BAR_WIDTH,
-                      )}`}
+                      )} · click for JEV panel`}
                     </text>
-                    <text fg={muted}>{`lane ${pick().lane || "-"} · click for history`}</text>
                   </>
                 )}
               </Show>
@@ -396,10 +451,10 @@ export default Plugin.define({
       },
     })
 
-    // ------------------------------------------------------- history blocks
+    // ---------------------------------------------------------- history UI
 
-    /** One decision rendered like a transcript message: role header + verdict. */
-    function historyEntry(decision: BridgeDecision) {
+    /** One decision as a transcript-like block: role, prompt, verdict, bar. */
+    function historyEntry(decision: BridgeDecision, index: number) {
       const theme = ctx.theme
       const base = theme?.text?.base
       const muted = theme?.text?.muted
@@ -409,63 +464,159 @@ export default Plugin.define({
         minute: "2-digit",
         second: "2-digit",
       })
-      const details = [
-        decision.reason,
-        decision.lane ? `lane ${decision.lane}` : "",
-        decision.backend,
-        decision.saved !== undefined ? `saved ${decision.saved >= 0 ? "+" : "-"}$${Math.abs(decision.saved).toFixed(4)}` : "",
-        when,
-      ].filter(Boolean)
       return (
-        <box {...SplitBorder} borderColor={accent} paddingLeft={1} flexDirection="column" gap={0}>
+        <box
+          {...SplitBorder}
+          borderColor={accent}
+          paddingLeft={1}
+          marginBottom={index < 59 ? 1 : 0}
+          flexDirection="column"
+          gap={0}
+        >
           <text fg={base} attributes={TextAttributes.BOLD}>
             {`▸ ${decision.lane || "delegated task"} · ${when}`}
           </text>
-          <text fg={base}>{`JEV picked ${shortRef(decision.model, 34)}`}</text>
+          <text fg={base} wrapMode="word">
+            {clipText(decision.task, PROMPT_MAX_CHARS)}
+          </text>
+          <text fg={accent} attributes={TextAttributes.BOLD}>
+            {`JEV picked ${shortRef(decision.model, 30)}`}
+          </text>
           <text fg={accent}>
             {`${bar(decision.probability, HISTORY_BAR_WIDTH)} ${(decision.probability * 100).toFixed(1)}%`}
           </text>
           <Show when={decision.defaultModel}>
-            <text fg={muted}>{`default ${shortRef(decision.defaultModel!, 30)}`}</text>
+            <text fg={muted}>{`default ${shortRef(decision.defaultModel!, 28)}`}</text>
           </Show>
-          <text fg={muted}>{details.join(" · ")}</text>
+          <Show when={savedOf(decision) > 0}>
+            <text fg={accent}>{`saved +$${savedOf(decision).toFixed(4)} on this task`}</text>
+          </Show>
+          <text fg={muted}>{`${decision.reason || ""} · ${decision.backend}`}</text>
         </box>
       )
     }
 
-    function historyBody() {
+    // History subscreen (route page) — scrollable, esc returns to the session.
+    function HistoryRoute() {
+      const theme = ctx.theme
+      keymap.layer(() => ({
+        mode: "global",
+        commands: [
+          {
+            id: `${PLUGIN_ID}.history.exit`,
+            bind: "escape",
+            title: "Back to session",
+            run: () => {
+              const last = bridge.decisions[0]
+              if (last?.sessionID) {
+                ui.router.navigate({ type: "session", sessionID: last.sessionID })
+                return
+              }
+              ui.router.navigate({ type: "home" })
+            },
+          },
+        ],
+      }))
       return (
-        <box flexDirection="column" gap={1}>
-          <Show
-            when={bridge.decisions.length > 0}
-            fallback={<text fg={ctx.theme?.text?.muted}>No JEV decisions recorded yet.</text>}
-          >
-            <For each={bridge.decisions.slice(0, 60)}>
-              {(decision: BridgeDecision) => historyEntry(decision)}
-            </For>
-          </Show>
+        <box flexDirection="column" padding={1} gap={1}>
+          <box flexDirection="row" justifyContent="space-between">
+            <text fg={theme?.text?.base} attributes={TextAttributes.BOLD}>
+              JEV decision history
+            </text>
+            <text fg={theme?.hue?.accent?.[200] ?? theme?.text?.base} attributes={TextAttributes.BOLD}>
+              {`saved $${savedTotal().toFixed(4)}`}
+            </text>
+          </box>
+          <text fg={theme?.text?.muted}>
+            {`${bridge.decisions.length} picks · esc back to session`}
+          </text>
+          <scrollbox flexGrow={1}>
+            <box flexDirection="column" gap={0}>
+              <Show
+                when={bridge.decisions.length > 0}
+                fallback={<text fg={theme?.text?.muted}>No JEV decisions recorded yet.</text>}
+              >
+                <For each={bridge.decisions.slice(0, 60)}>
+                  {(decision: BridgeDecision, index: () => number) => historyEntry(decision, index())}
+                </For>
+              </Show>
+            </box>
+          </scrollbox>
         </box>
       )
     }
 
     const unregisterRoute = ui.router.register({
       name: "history",
-      render: () => (
-        <box flexDirection="column" gap={1}>
-          <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
-            JEV decision history
-          </text>
-          {historyBody()}
-        </box>
-      ),
+      render: () => <HistoryRoute />,
     })
 
-    // Session panel — mounted while a panel is open; gate on the selected name.
+    // ---------------------------------------------------------- session UI
+
+    /**
+     * Session panel (right side): status only — is JEV working, did the last
+     * pick succeed, and the prompt it was for. No model, no probabilities.
+     */
+    function JevStatusPanel(props: { panel: PanelInput }) {
+      const theme = ctx.theme
+      const base = theme?.text?.base
+      const muted = theme?.text?.muted
+      const accent = theme?.hue?.accent?.[200] ?? base
+      const last = bridge.decisions[0]
+      keymap.layer(() => ({
+        mode: "global",
+        commands: [
+          {
+            id: `${PLUGIN_ID}.panel.close`,
+            bind: "escape",
+            title: "Close JEV panel",
+            run: () => props.panel.close(),
+          },
+          {
+            id: `${PLUGIN_ID}.panel.history`,
+            bind: "h",
+            title: "Full JEV history",
+            run: openHistory,
+          },
+        ],
+      }))
+      return (
+        <box flexDirection="column" padding={1} gap={1}>
+          <text fg={base} attributes={TextAttributes.BOLD}>
+            JEV
+          </text>
+          <text fg={bridge.enabled ? accent : muted}>
+            {`${bridge.enabled ? "● working" : "○ paused"} · ${bridge.decisions.length} picks`}
+          </text>
+          <Show when={last} fallback={<text fg={muted}>no delegated tasks yet</text>}>
+            {(pick: () => BridgeDecision) => (
+              <>
+                <text fg={accent}>
+                  {`last pick ✓ ${new Date(pick().ts).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}`}
+                </text>
+                <text fg={muted}>last prompt</text>
+                <text fg={base} wrapMode="word">
+                  {clipText(pick().task, PROMPT_MAX_CHARS)}
+                </text>
+              </>
+            )}
+          </Show>
+          <text fg={accent} attributes={TextAttributes.BOLD}>
+            {`saved $${savedTotal().toFixed(4)}`}
+          </text>
+          <text fg={muted}>esc close · h full history · bars live in the transcript</text>
+        </box>
+      )
+    }
+
     ui.slot({
       append: "session.panel",
       render: (panel: PanelInput) => (
         <Show when={panel.name === PANEL_NAME}>
-          <HistoryPanel />
+          <JevStatusPanel panel={panel} />
         </Show>
       ),
     })
@@ -583,7 +734,7 @@ export default Plugin.define({
       const accent = theme?.hue?.accent?.[200] ?? base
 
       return (
-        <box flexDirection="column" gap={0}>
+        <box flexDirection="column" padding={1} gap={0}>
           <text fg={base} attributes={TextAttributes.BOLD}>
             {`Models JEV may consider — ${chosen().size}/${props.models.length}`}
           </text>
@@ -607,7 +758,7 @@ export default Plugin.define({
               )
             }}
           </For>
-          <text fg={muted}>
+          <text fg={muted} marginTop={1}>
             {`page ${page() + 1}/${pages()} ←/→ · space toggle · f free-only: ${freeOnly() ? "ON" : "OFF"} · a all/none`}
           </text>
           <text fg={muted}>enter save · esc cancel</text>

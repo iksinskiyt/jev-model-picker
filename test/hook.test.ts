@@ -22,6 +22,7 @@ function runtimeWithPick(pick: any) {
     pick,
     lanePin: () => undefined,
     priceRatio: async () => 1,
+    pricesFor: async () => ({ picked: 0, def: 0 }),
   } as unknown as PickerRuntime;
 }
 

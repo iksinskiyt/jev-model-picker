@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   bridgeDirectory,
   bridgeFile,
+  counterfactualGain,
   defaultState,
   readBridge,
   recordDecisionToBridge,
@@ -46,7 +47,8 @@ test("recordDecisionToBridge prepends and survives re-reads", () => {
     backend: "systemone",
     lane: "explorer",
     task: "digest",
-    ratio: 0.25,
+    pickedPrice: 0,
+    defaultPrice: 6,
   });
   recordDecisionToBridge({
     ts: 2,
@@ -58,12 +60,13 @@ test("recordDecisionToBridge prepends and survives re-reads", () => {
     backend: "systemone",
     lane: "librarian",
     task: "digest2",
-    ratio: 0,
+    pickedPrice: 0,
+    defaultPrice: 12,
   });
   const read = readBridge();
   expect(read.decisions.length).toBe(2);
   expect(read.decisions[0]!.model).toBe("opencode/b");
-  expect(read.decisions[0]!.ratio).toBe(0);
+  expect(read.decisions[0]!.defaultPrice).toBe(12);
 });
 
 test("recordDecisionToBridge keeps enabled/settings written before it", () => {
@@ -80,7 +83,8 @@ test("recordDecisionToBridge keeps enabled/settings written before it", () => {
     backend: "systemone",
     lane: "fixer",
     task: "d",
-    ratio: 1,
+    pickedPrice: 3,
+    defaultPrice: 3,
   });
   const read = readBridge();
   expect(read.enabled).toBe(false);
@@ -91,6 +95,17 @@ test("readBridge heals a corrupt file", () => {
   mkdirSync(bridgeDirectory(), { recursive: true });
   writeFileSync(bridgeFile(), "{not json");
   expect(readBridge()).toEqual(defaultState());
+});
+
+test("writeBridge bumps the revision counter", () => {
+  const first = defaultState();
+  writeBridge(first);
+  expect(first.rev).toBe(1);
+  expect(readBridge().rev).toBe(1);
+  const state = readBridge();
+  writeBridge(state);
+  expect(state.rev).toBe(2);
+  expect(readBridge().rev).toBe(2);
 });
 
 test("catalog computes blended price per MTok", async () => {
@@ -120,4 +135,20 @@ test("catalog allowlist restricts candidates", async () => {
   const out = await listCandidates(ctx, resolveConfig({}), undefined, undefined, ["a/2"]);
   expect(out.length).toBe(1);
   expect(out[0]!.ref).toBe("a/2");
+});
+
+test("counterfactualGain prices free picks by avoided default cost", () => {
+  // 5k tokens that cost $0 on a free pick; the default costs $12/MTok.
+  expect(counterfactualGain(5000, 12, 0)).toBeCloseTo(0.06, 6);
+});
+
+test("counterfactualGain nets actual cost on paid picks", () => {
+  // Same tokens on a $3/MTok pick cost $0.015; default $15/MTok → saved $0.06.
+  expect(counterfactualGain(5000, 15, 0.015)).toBeCloseTo(0.06, 6);
+});
+
+test("counterfactualGain ignores idle windows and negative gains", () => {
+  expect(counterfactualGain(0, 12, 0)).toBe(0);
+  expect(counterfactualGain(0, 12, 0.05)).toBe(-0.05);
+  expect(counterfactualGain(100, 0, 0)).toBe(0);
 });
