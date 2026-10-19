@@ -64,6 +64,11 @@ function clockTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
 }
 
+/** One-line, whitespace-collapsed prompt for the sidebar row. */
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim()
+}
+
 type Price = { ref: string; provider: string; pricePerMTok: number }
 
 function priceOf(model: any): Price {
@@ -424,6 +429,7 @@ export default Plugin.define({
         const s = status()
         const saved = savedTotal()
         const last = lastPick()
+        const prompt = last?.task ? oneLine(last.task) : ""
         return (
           <box flexDirection="column">
             <box
@@ -440,10 +446,9 @@ export default Plugin.define({
               </text>
               <text fg={base} wrapMode="none" truncate flexGrow={1} flexShrink={1} minWidth={0}>
                 <b>JEV</b>
-                <span style={{ fg: muted }}>{` ${s.label}`}</span>
-                <Show when={last && !s.working}>
-                  <span style={{ fg: muted }}>{` · ${clockTime(last!.ts)}`}</span>
-                </Show>
+                <span style={{ fg: muted }}>
+                  {` ${s.label}${prompt ? ` · ${prompt}` : !last ? "" : ` · ${clockTime(last!.ts)}`}`}
+                </span>
               </text>
             </box>
             <Show when={saved > 0}>
