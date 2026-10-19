@@ -35,6 +35,22 @@ export function matchesTool(name: string, configured: string[]): boolean {
   });
 }
 
+/**
+ * Persist a pick so the TUI (and any later reader) can render probability
+ * bars for it. Best-effort: storage failures never break a delegation.
+ */
+export async function recordDecision(ctx: any, decision: any): Promise<void> {
+  try {
+    if (!ctx?.storage?.set) return;
+    await ctx.storage.set(
+      `jev-decisions/${decision.sessionID}/${decision.callID}`,
+      JSON.stringify(decision),
+    );
+  } catch {
+    // logging is best-effort
+  }
+}
+
 export async function registerDelegationHook(
   ctx: any,
   runtime: PickerRuntime,
@@ -69,6 +85,21 @@ export async function registerDelegationHook(
       input.model = pick.ref;
       // …and replace the input for hosts that swap the object.
       event.input = { ...input, model: pick.ref };
+
+      await recordDecision(ctx, {
+        sessionID: event?.sessionID ?? "",
+        messageID: event?.messageID ?? "",
+        callID: event?.id ?? "",
+        ts: Date.now(),
+        model: pick.ref,
+        probability: pick.probability,
+        margin: pick.margin,
+        reason: pick.reason,
+        backend: pick.backend,
+        lane: lane ?? "",
+        task,
+        costDelta: pick.costDelta ?? 0,
+      });
     } catch {
       // never break a delegation
     }

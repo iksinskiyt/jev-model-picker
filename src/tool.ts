@@ -23,6 +23,37 @@ const STATUS_INPUT_SCHEMA = {
   additionalProperties: false,
 };
 
+/**
+ * Unicode probability bar. `█` = filled, `░` = empty. 20 columns ≈ 5% per cell.
+ */
+export function probabilityBar(fraction: number, width = 20): string {
+  const value = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 0;
+  const filled = Math.round(value * width);
+  return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled));
+}
+
+/**
+ * Human-readable rendering of a pick, so the answer reads well in the
+ * session history: which model won, how confident Jev was, and why.
+ */
+export function formatPick(pick: {
+  ref: string;
+  probability: number;
+  margin: number;
+  reason: string;
+  backend: string;
+  latencyMs?: number;
+}): string {
+  const pct = (pick.probability * 100).toFixed(1);
+  const lines = [
+    `JEV picked ${pick.ref}`,
+    `${probabilityBar(pick.probability)} ${pct}%  (margin ${pick.margin.toFixed(2)})`,
+    `reason: ${pick.reason}`,
+    `backend: ${pick.backend}${pick.latencyMs ? ` · ${pick.latencyMs}ms` : ""}`,
+  ];
+  return lines.join("\n");
+}
+
 export async function registerPickTools(
   ctx: any,
   runtime: PickerRuntime,
@@ -38,25 +69,36 @@ export async function registerPickTools(
           typeof input?.lane === "string" && input.lane ? input.lane : undefined,
           String(input?.task ?? ""),
         );
+        if (!pick) {
+          return {
+            content: JSON.stringify(
+              { model: null, note: "no pick — keep the lane's pinned model" },
+              null,
+              2,
+            ),
+          };
+        }
         return {
-          content: pick
-            ? JSON.stringify(
-                {
-                  model: pick.ref,
-                  probability: pick.probability,
-                  margin: pick.margin,
-                  reason: pick.reason,
-                  backend: pick.backend,
-                  latencyMs: pick.latencyMs,
-                },
-                null,
-                2,
-              )
-            : JSON.stringify(
-                { model: null, note: "no pick — keep the lane's pinned model" },
-                null,
-                2,
-              ),
+          // Human-readable first so the transcript shows the probability bar,
+          // then the machine-readable payload.
+          content: [
+            formatPick(pick),
+            "",
+            "```json",
+            JSON.stringify(
+              {
+                model: pick.ref,
+                probability: pick.probability,
+                margin: pick.margin,
+                reason: pick.reason,
+                backend: pick.backend,
+                latencyMs: pick.latencyMs,
+              },
+              null,
+              2,
+            ),
+            "```",
+          ].join("\n"),
         };
       },
     });
@@ -68,54 +110,22 @@ export async function registerPickTools(
       input: STATUS_INPUT_SCHEMA,
       execute: async () => {
         const lanes = runtime.laneNames();
-        let candidateRefs: string[] = [];
-        try {
-          candidateRefs = (await runtime.candidatesFor()).map((c) => c.ref);
-        } catch {
-          candidateRefs = [];
-        }
-
-        let availableTools: string[] = [];
-        try {
-          const list = await ctx?.tool?.list?.();
-          availableTools = (list ?? [])
-            .map((t: any) => t?.id ?? t?.name)
-            .filter((n: any) => typeof n === "string");
-        } catch {
-          availableTools = [];
-        }
-
+        const pins = lanes.map((l: string) => {
+          const pin = runtime.lanePin(l);
+          return pin ? `${l}: ${pin.ref}` : `${l}: (none)`;
+        });
         return {
-          content: JSON.stringify(
-            {
-              backends: runtime.cfg.backends.map((b) =>
-                b.kind === "systemone"
-                  ? {
-                      kind: b.kind,
-                      model: b.model,
-                      baseURL: b.baseURL,
-                      keyless: !b.apiKey,
-                    }
-                  : {
-                      kind: b.kind,
-                      model: b.model,
-                      baseURL: b.baseURL ?? null,
-                      providerID: b.providerID ?? null,
-                      hasKey: !!b.apiKey,
-                    },
-              ),
-              tools: runtime.cfg.tools,
-              availableTools,
-              lanes,
-              lanePins: Object.fromEntries(
-                lanes.map((lane) => [lane, runtime.lanePin(lane) ?? null]),
-              ),
-              candidates: candidateRefs,
-              recentDecisions: await runtime.recentDecisions(5),
-            },
-            null,
-            2,
-          ),
+          content: [
+            "JEV status",
+            `Backends: ${runtime.cfg.backends
+              .map((b: any) => `${b.kind}:${b.model}`)
+              .join(", ")}`,
+            `OMO-Slim lanes (${lanes.length}):`,
+            ...pins,
+            `Candidates: ${runtime.cfg.policy.maxCandidates ?? "default"}`,
+            "",
+            `Recent picks: ${runtime.cfg.logDecisions ? "logged" : "off"}`,
+          ].join("\n"),
         };
       },
     });
