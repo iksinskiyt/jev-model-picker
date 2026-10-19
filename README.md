@@ -35,7 +35,10 @@ Add the plugin to your OpenCode V2 config (`~/.config/opencode/opencode.jsonc`):
   "plugins": [
     "oh-my-opencode-slim", // optional
     {
-      "package": "file:///F:/code/jev-model-picker", // or "jev-model-picker" once published
+      // Local checkout: point at the directory (absolute path or file:// URL).
+      // OpenCode probes <dir>/server, then <dir>/index — this repo ships a root
+      // `server.ts` for exactly that. Published: use "jev-model-picker" instead.
+      "package": "F:/code/jev-model-picker",
       "options": {
         "systemone": {
           "baseURL": "https://opencode.ai/inference/systemone/v1",
@@ -144,8 +147,18 @@ bun run probe     # live smoke test: gateway models + one real Jev pick
 bunx tsc --noEmit # typecheck
 ```
 
-The plugin is loaded by OpenCode directly from TypeScript source
-(`exports` → `src/index.ts`), so there's no build step.
+The plugin is loaded by OpenCode directly from TypeScript source, so there's no
+build step. Two loading conventions exist:
+
+- **Local checkout**: the config entry must be a **directory** (absolute path or
+  `file://` URL). OpenCode probes `<dir>/server`, then `<dir>/index` — the root
+  `server.ts` re-exports `src/index.ts` to satisfy the first probe. Absolute
+  *file* paths are rejected with `configured plugin path must be a directory`.
+- **npm package** (`"package": "jev-model-picker"`): the host resolves the
+  `./server` subpath from `exports`, which also points at `src/index.ts`.
+
+Config edits, and edits to the plugin's own files, hot-reload it in a running
+OpenCode server — no restart needed.
 
 ## Roadmap
 
