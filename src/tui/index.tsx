@@ -10,30 +10,45 @@ import { existsSync, statSync } from "node:fs"
 /**
  * TUI surface for jev-model-picker.
  *
- * The probability bars themselves live in the session history: the server
- * plugin appends a formatted bar to every delegated tool result (see
- * src/hook.ts → execute.after). This plugin renders:
- * - a compact right-sidebar occupancy line (last pick + saved estimate),
- * - the full history in a session panel (`/jev-panel`) and a route page,
- * - palette/plus commands: toggle, model allow-list picker, backend linker.
+ * Probability bars live in the session transcript (the server appends them to
+ * each delegated tool result — see src/hook.ts). This plugin renders:
+ * - a clickable right-sidebar occupancy block: a JEV ON/OFF button, the last
+ *   pick, and a click-anywhere-open history action,
+ * - the history as message-like blocks (same SplitBorder look as session
+ *   messages) in a session panel and a route page,
+ * - palette commands: toggle, model allow-list picker (paged), backend linker.
  */
 
 const PLUGIN_ID = "jev-model-picker"
 const PANEL_NAME = `${PLUGIN_ID}.history`
 const SAVINGS_POLL_MS = 1500
 const BRIDGE_WRITE_DEBOUNCE_MS = 2000
-const BAR_WIDTH = 18
 const MINI_BAR_WIDTH = 10
-const FOOTER_WIDTH = 24
+const HISTORY_BAR_WIDTH = 24
+const PICKER_PAGE_ROWS = 11
 
-function bar(fraction: number, width = BAR_WIDTH): string {
+function bar(fraction: number, width: number): string {
   const value = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 0
   const filled = Math.round(value * width)
   return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled))
 }
 
-function pct(fraction: number): string {
-  return `${(Math.max(0, Math.min(1, fraction)) * 100).toFixed(1)}%`
+// Same left-rail the session transcript uses for message blocks.
+const SplitBorder = {
+  border: ["left" as const],
+  customBorderChars: {
+    topLeft: "",
+    bottomLeft: "",
+    topRight: "",
+    bottomRight: "",
+    vertical: "┃",
+    horizontal: " ",
+    bottomT: "",
+    topT: "",
+    cross: "",
+    leftT: "",
+    rightT: "",
+  },
 }
 
 function shortRef(ref: string, width = 26): string {
@@ -42,7 +57,7 @@ function shortRef(ref: string, width = 26): string {
 
 type Price = { ref: string; provider: string; pricePerMTok: number }
 
-function priceOf(model: any): { ref: string; provider: string; pricePerMTok: number } {
+function priceOf(model: any): Price {
   const provider = String(model?.providerID ?? model?.provider?.id ?? "?")
   const id = String(model?.id ?? model?.modelID ?? "")
   const ref = model?.id ?? (id ? `${provider}/${id}` : "")
@@ -61,10 +76,52 @@ function priceLabel(price: number): string {
   return `$${price.toFixed(2)}/MTok`
 }
 
+/** Clickable terminal button; ignores drags that select text. */
+function Button(props: { label: string; onClick: () => void; children?: any }) {
+  const theme = useThemeSafe()
+  const [hovered, setHovered] = createSignal(false)
+  return (
+    <box
+      height={1}
+      paddingLeft={1}
+      paddingRight={1}
+      backgroundColor={hovered() ? theme.hovered : undefined}
+      onMouseOver={() => setHovered(true)}
+      onMouseOut={() => setHovered(false)}
+      onMouseUp={() => {
+        const selection = ctxRendererSelection()
+        if (selection) return
+        props.onClick()
+      }}
+    >
+      <text fg={theme.base} attributes={TextAttributes.BOLD}>
+        {props.label}
+      </text>
+    </box>
+  )
+}
+
+let pluginCtx: Context
+function ctxRendererSelection(): string | undefined {
+  try {
+    return pluginCtx?.renderer?.getSelection?.()?.getSelectedText?.() || undefined
+  } catch {
+    return undefined
+  }
+}
+function useThemeSafe() {
+  const theme = pluginCtx?.theme
+  return {
+    base: theme?.text?.base,
+    hovered: theme?.background?.action?.primary?.hovered ?? theme?.hue?.accent?.[300],
+  }
+}
+
 export default Plugin.define({
   id: `${PLUGIN_ID}-tui`,
   async setup(ctx: Context) {
     const { ui, keymap, data } = ctx
+    pluginCtx = ctx
     const location = () => ctx.location ?? data.location.default()
 
     // ---------------------------------------------------------------- state
@@ -105,10 +162,7 @@ export default Plugin.define({
 
     // -------------------------------------------------- savings attribution
 
-    // Family cost deltas after each pick, scaled by (1 - price ratio) vs the
-    // lane's default model, become the pick's counterfactual saving.
     const baselines = new Map<number, number>()
-
     const attributeCosts = () => {
       let changed = false
       for (const decision of bridge.decisions) {
@@ -151,107 +205,29 @@ export default Plugin.define({
       onCleanup(() => clearInterval(timer))
     })
 
-    // --------------------------------------------------------------- widgets
+    // ------------------------------------------------------------- commands
 
-    const savedTotal = () =>
-      bridge.decisions.reduce((sum: number, d: BridgeDecision) => sum + (d.saved ?? 0), 0)
+    const toggleEnabled = () => {
+      bridge = readBridge()
+      bridge.enabled = !bridge.enabled
+      persist()
+      bump()
+      ui.toast.show({
+        title: "JEV",
+        message: bridge.enabled ? "assistance ON" : "assistance OFF",
+        variant: bridge.enabled ? "success" : "warning",
+      })
+    }
 
-    // Right sidebar: occupancy only — one status line plus the last pick.
-    ui.slot({
-      append: "sidebar.content",
-      render: () => {
-        void version()
-        const theme = ctx.theme
-        const base = theme?.text?.base
-        const muted = theme?.text?.muted
-        const accent = theme?.hue?.accent?.[200] ?? base
-        const last = bridge.decisions[0]
-        const saved = savedTotal()
-        return (
-          <box flexDirection="column" gap={0}>
-            <text fg={base} attributes={TextAttributes.BOLD}>
-              {`JEV ${bridge.enabled ? "ON" : "OFF"} · ${bridge.decisions.length} picks`}
-            </text>
-            <Show when={last} fallback={<text fg={muted}>waiting for a delegated task</text>}>
-              {(pick: () => BridgeDecision) => (
-                <text fg={base}>
-                  {`${shortRef(pick().model, 20)} ${(pick().probability * 100).toFixed(0)}% ${bar(
-                    pick().probability,
-                    MINI_BAR_WIDTH,
-                  )}`}
-                </text>
-              )}
-            </Show>
-            <Show when={last?.lane}>
-              <text fg={muted}>{`lane ${last!.lane}`}</text>
-            </Show>
-            <text fg={saved >= 0 ? accent : muted} attributes={TextAttributes.BOLD}>
-              {`saved $${saved.toFixed(4)}`}
-            </text>
-          </box>
-        )
-      },
-    })
-
-    // Full history body, shared by the session panel and the route page.
-    const historyBody = () => (
-      <box flexDirection="column" gap={1}>
-        <Show
-          when={bridge.decisions.length > 0}
-          fallback={<text fg={ctx.theme?.text?.muted}>No JEV decisions recorded yet.</text>}
-        >
-          <For each={bridge.decisions.slice(0, 60)}>
-            {(decision: BridgeDecision) => (
-              <box flexDirection="column">
-                <text fg={ctx.theme?.text?.base}>
-                  {`${bar(decision.probability)} ${pct(decision.probability)}  ${shortRef(decision.model, 30)}`}
-                </text>
-                <text fg={ctx.theme?.text?.muted}>
-                  {[
-                    decision.reason,
-                    decision.lane ? `lane ${decision.lane}` : "",
-                    decision.backend,
-                    new Date(decision.ts).toLocaleTimeString(),
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </text>
-              </box>
-            )}
-          </For>
-        </Show>
-      </box>
-    )
-
-    // Session panel — mounted only while a panel is open, so gate on the
-    // selected name the host passes in.
-    ui.slot({
-      append: "session.panel",
-      render: (panel: PanelInput) => (
-        <Show when={panel.name === PANEL_NAME}>
-          <box flexDirection="column" gap={1}>
-            <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
-              {`JEV history · saved $${savedTotal().toFixed(4)}`}
-            </text>
-            {historyBody()}
-          </box>
-        </Show>
-      ),
-    })
-
-    const unregisterRoute = ui.router.register({
-      name: "history",
-      render: () => (
-        <box flexDirection="column" gap={1}>
-          <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
-            JEV decision history
-          </text>
-          {historyBody()}
-        </box>
-      ),
-    })
-
-    // -------------------------------------------------------------- commands
+    const openHistory = () => {
+      const route = ui.router.current()
+      if (route.type !== "session") {
+        ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
+        return
+      }
+      const opened = ui.panel.open(PANEL_NAME)
+      if (!opened) ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
+    }
 
     const commands = () => [
       {
@@ -261,17 +237,7 @@ export default Plugin.define({
         group: "JEV",
         palette: true as const,
         slash: { name: "jev-toggle" },
-        run: () => {
-          bridge = readBridge()
-          bridge.enabled = !bridge.enabled
-          persist()
-          bump()
-          ui.toast.show({
-            title: "JEV",
-            message: bridge.enabled ? "assistance ON" : "assistance OFF",
-            variant: bridge.enabled ? "success" : "warning",
-          })
-        },
+        run: toggleEnabled,
       },
       {
         id: `${PLUGIN_ID}.models`,
@@ -290,6 +256,8 @@ export default Plugin.define({
             const raw = (readBridge().settings?.allowlist as string[] | undefined) ?? []
             return raw.length ? new Set(raw) : new Set(prices.map((p) => p.ref))
           }
+          // Standard dialog size, with the picker's own paging inside it.
+          ui.dialog.set({ size: "medium" })
           ui.dialog.show(() => (
             <ModelPicker
               models={prices}
@@ -357,15 +325,7 @@ export default Plugin.define({
         group: "JEV",
         palette: true as const,
         slash: { name: "jev-history" },
-        run: () => {
-          const route = ui.router.current()
-          if (route.type !== "session") {
-            ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
-            return
-          }
-          const opened = ui.panel.open(PANEL_NAME)
-          if (!opened) ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
-        },
+        run: openHistory,
       },
     ]
 
@@ -375,6 +335,141 @@ export default Plugin.define({
       commands: commands(),
     }))
 
+    // -------------------------------------------------------------- sidebar
+
+    const savedTotal = () =>
+      bridge.decisions.reduce((sum: number, d: BridgeDecision) => sum + (d.saved ?? 0), 0)
+
+    const HistoryPanel = (props: { panel?: PanelInput }) => (
+      <box flexDirection="column" gap={1}>
+        <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
+          {`JEV history · saved $${savedTotal().toFixed(4)}`}
+        </text>
+        {historyBody()}
+      </box>
+    )
+
+    // Right sidebar: occupancy only — a toggle button, the last pick, and the
+    // whole block opens the history on click.
+    ui.slot({
+      append: "sidebar.content",
+      render: () => {
+        void version()
+        const theme = ctx.theme
+        const base = theme?.text?.base
+        const muted = theme?.text?.muted
+        const accent = theme?.hue?.accent?.[200] ?? base
+        const last = bridge.decisions[0]
+        const saved = savedTotal()
+        return (
+          <box flexDirection="column" gap={0}>
+            <Button
+              label={` JEV ${bridge.enabled ? "ON" : "OFF"} ▸ `}
+              onClick={toggleEnabled}
+            />
+            <box
+              flexDirection="column"
+              onMouseUp={() => {
+                if (ctxRendererSelection()) return
+                openHistory()
+              }}
+            >
+              <Show when={last} fallback={<text fg={muted}>waiting for a delegated task</text>}>
+                {(pick: () => BridgeDecision) => (
+                  <>
+                    <text fg={base}>
+                      {`${shortRef(pick().model, 18)} ${(pick().probability * 100).toFixed(0)}% ${bar(
+                        pick().probability,
+                        MINI_BAR_WIDTH,
+                      )}`}
+                    </text>
+                    <text fg={muted}>{`lane ${pick().lane || "-"} · click for history`}</text>
+                  </>
+                )}
+              </Show>
+            </box>
+            <text fg={saved >= 0 ? accent : muted} attributes={TextAttributes.BOLD}>
+              {`saved $${saved.toFixed(4)}`}
+            </text>
+          </box>
+        )
+      },
+    })
+
+    // ------------------------------------------------------- history blocks
+
+    /** One decision rendered like a transcript message: role header + verdict. */
+    function historyEntry(decision: BridgeDecision) {
+      const theme = ctx.theme
+      const base = theme?.text?.base
+      const muted = theme?.text?.muted
+      const accent = theme?.hue?.accent?.[200] ?? base
+      const when = new Date(decision.ts).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+      const details = [
+        decision.reason,
+        decision.lane ? `lane ${decision.lane}` : "",
+        decision.backend,
+        decision.saved !== undefined ? `saved ${decision.saved >= 0 ? "+" : "-"}$${Math.abs(decision.saved).toFixed(4)}` : "",
+        when,
+      ].filter(Boolean)
+      return (
+        <box {...SplitBorder} borderColor={accent} paddingLeft={1} flexDirection="column" gap={0}>
+          <text fg={base} attributes={TextAttributes.BOLD}>
+            {`▸ ${decision.lane || "delegated task"} · ${when}`}
+          </text>
+          <text fg={base}>{`JEV picked ${shortRef(decision.model, 34)}`}</text>
+          <text fg={accent}>
+            {`${bar(decision.probability, HISTORY_BAR_WIDTH)} ${(decision.probability * 100).toFixed(1)}%`}
+          </text>
+          <Show when={decision.defaultModel}>
+            <text fg={muted}>{`default ${shortRef(decision.defaultModel!, 30)}`}</text>
+          </Show>
+          <text fg={muted}>{details.join(" · ")}</text>
+        </box>
+      )
+    }
+
+    function historyBody() {
+      return (
+        <box flexDirection="column" gap={1}>
+          <Show
+            when={bridge.decisions.length > 0}
+            fallback={<text fg={ctx.theme?.text?.muted}>No JEV decisions recorded yet.</text>}
+          >
+            <For each={bridge.decisions.slice(0, 60)}>
+              {(decision: BridgeDecision) => historyEntry(decision)}
+            </For>
+          </Show>
+        </box>
+      )
+    }
+
+    const unregisterRoute = ui.router.register({
+      name: "history",
+      render: () => (
+        <box flexDirection="column" gap={1}>
+          <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
+            JEV decision history
+          </text>
+          {historyBody()}
+        </box>
+      ),
+    })
+
+    // Session panel — mounted while a panel is open; gate on the selected name.
+    ui.slot({
+      append: "session.panel",
+      render: (panel: PanelInput) => (
+        <Show when={panel.name === PANEL_NAME}>
+          <HistoryPanel />
+        </Show>
+      ),
+    })
+
     // ------------------------------------------------------------- picker UI
 
     function ModelPicker(props: {
@@ -383,23 +478,17 @@ export default Plugin.define({
       onDone: (next: Set<string>) => void
     }) {
       type Row =
-        | { kind: "provider"; provider: string; refs: string[]; selectedCount: number }
+        | { kind: "provider"; provider: string; refs: string[] }
         | { kind: "model"; ref: string; provider: string; pricePerMTok: number }
 
       const providers = [...new Set(props.models.map((p) => p.provider))].sort()
-      const rows: Row[] = []
+      const ordered: Row[] = []
       for (const provider of providers) {
         const refs = props.models.filter((p) => p.provider === provider).map((p) => p.ref)
-        rows.push({ kind: "provider", provider, refs, selectedCount: refs.length })
-      }
-      // Provider headers first (stable order), models listed under theirs.
-      const ordered: Row[] = []
-      for (const header of rows) {
-        const refs = (header as { refs: string[] }).refs
-        ordered.push(header)
+        ordered.push({ kind: "provider", provider, refs })
         for (const ref of refs) {
           const entry = props.models.find((p) => p.ref === ref)!
-          ordered.push({ kind: "model", ref, provider: entry.provider, pricePerMTok: entry.pricePerMTok })
+          ordered.push({ kind: "model", ref, provider, pricePerMTok: entry.pricePerMTok })
         }
       }
 
@@ -408,7 +497,16 @@ export default Plugin.define({
       const [freeOnly, setFreeOnly] = createSignal(false)
       let beforeFreeOnly = new Set(props.selected)
       const freeRefs = props.models.filter((p) => p.pricePerMTok <= 0).map((p) => p.ref)
-      const refWidth = Math.min(34, Math.max(...props.models.map((p) => p.ref.length)) + 1)
+      const refWidth = Math.min(30, Math.max(...props.models.map((p) => p.ref.length)) + 1)
+      const pages = () => Math.max(1, Math.ceil(ordered.length / PICKER_PAGE_ROWS))
+      const page = () => Math.floor(cursor() / PICKER_PAGE_ROWS)
+
+      const move = (delta: number) =>
+        setCursor((i) => Math.max(0, Math.min(ordered.length - 1, i + delta)))
+      const gotoPage = (delta: number) => {
+        const next = Math.max(0, Math.min(pages() - 1, page() + delta))
+        setCursor(next * PICKER_PAGE_ROWS)
+      }
 
       const toggleRow = () => {
         const row = ordered[cursor()]
@@ -440,8 +538,10 @@ export default Plugin.define({
       keymap.layer(() => ({
         mode: "global",
         commands: [
-          { bind: "up", run: () => setCursor((i) => Math.max(0, i - 1)) },
-          { bind: "down", run: () => setCursor((i) => Math.min(ordered.length - 1, i + 1)) },
+          { bind: "up", run: () => move(-1) },
+          { bind: "down", run: () => move(1) },
+          { bind: "left", run: () => gotoPage(-1) },
+          { bind: "right", run: () => gotoPage(1) },
           { bind: "space", run: toggleRow },
           {
             bind: "f",
@@ -472,14 +572,10 @@ export default Plugin.define({
         ],
       }))
 
-      const visible = () => {
-        const height = (ctx.renderer.height ?? 24) - 6
-        const start = Math.max(
-          0,
-          Math.min(cursor() - Math.floor(height / 2), Math.max(0, ordered.length - height)),
-        )
-        return ordered.slice(start, start + height).map((row, offset) => ({ row, index: start + offset }))
-      }
+      const visible = () =>
+        ordered
+          .slice(page() * PICKER_PAGE_ROWS, (page() + 1) * PICKER_PAGE_ROWS)
+          .map((row, offset) => ({ row, index: page() * PICKER_PAGE_ROWS + offset }))
 
       const theme = ctx.theme
       const base = theme?.text?.base
@@ -490,9 +586,6 @@ export default Plugin.define({
         <box flexDirection="column" gap={0}>
           <text fg={base} attributes={TextAttributes.BOLD}>
             {`Models JEV may consider — ${chosen().size}/${props.models.length}`}
-          </text>
-          <text fg={muted}>
-            {`up/down move · space toggle · f free-only: ${freeOnly() ? "ON" : "OFF"} · a all/none · enter save · esc cancel`}
           </text>
           <For each={visible()}>
             {({ row, index }: { row: Row; index: number }) => {
@@ -507,14 +600,17 @@ export default Plugin.define({
                 )
               }
               const mark = chosen().has(row.ref) ? "[x]" : "[ ]"
-              const price = priceLabel(row.pricePerMTok).padStart(12)
               return (
                 <text fg={fg}>
-                  {`  ${mark} ${row.ref.padEnd(refWidth)} ${price}`}
+                  {`  ${mark} ${row.ref.padEnd(refWidth)} ${priceLabel(row.pricePerMTok).padStart(11)}`}
                 </text>
               )
             }}
           </For>
+          <text fg={muted}>
+            {`page ${page() + 1}/${pages()} ←/→ · space toggle · f free-only: ${freeOnly() ? "ON" : "OFF"} · a all/none`}
+          </text>
+          <text fg={muted}>enter save · esc cancel</text>
         </box>
       )
     }
