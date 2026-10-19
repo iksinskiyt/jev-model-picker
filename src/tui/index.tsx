@@ -3,29 +3,28 @@ import { Plugin } from "@opencode/plugin/tui"
 import type { Context, PanelInput } from "@opencode/plugin/tui/context"
 import { createSignal, For, Show, onCleanup, onMount } from "solid-js"
 import { TextAttributes } from "@opentui/core"
-import { bridgeFile, defaultState, readBridge, writeBridge } from "../bridge"
+import { bridgeFile, readBridge, writeBridge } from "../bridge"
 import type { BridgeDecision, BridgeState } from "../bridge"
 import { existsSync, statSync } from "node:fs"
 
 /**
- * TUI surface for jev-model-picker — the "JEV engaged" panel.
+ * TUI surface for jev-model-picker.
  *
- * - Sidebar (always visible): JEV on/off, the last pick with a probability
- *   bar, and a live savings estimate vs the OMO-Slim default models.
- * - Session panel (jev:panel): full decision history with probability bars.
- * - Palette commands: toggle, choose considered models, link a backend,
- *   open the history panel.
- *
- * Decisions are written by the server plugin into the shared bridge file
- * (src/bridge.ts); this plugin watches it and attributes family cost deltas
- * to each pick so "Saved $x" stays live.
+ * The probability bars themselves live in the session history: the server
+ * plugin appends a formatted bar to every delegated tool result (see
+ * src/hook.ts → execute.after). This plugin renders:
+ * - a compact right-sidebar occupancy line (last pick + saved estimate),
+ * - the full history in a session panel (`/jev-panel`) and a route page,
+ * - palette/plus commands: toggle, model allow-list picker, backend linker.
  */
 
 const PLUGIN_ID = "jev-model-picker"
 const PANEL_NAME = `${PLUGIN_ID}.history`
-const BAR_WIDTH = 18
 const SAVINGS_POLL_MS = 1500
 const BRIDGE_WRITE_DEBOUNCE_MS = 2000
+const BAR_WIDTH = 18
+const MINI_BAR_WIDTH = 10
+const FOOTER_WIDTH = 24
 
 function bar(fraction: number, width = BAR_WIDTH): string {
   const value = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 0
@@ -37,27 +36,39 @@ function pct(fraction: number): string {
   return `${(Math.max(0, Math.min(1, fraction)) * 100).toFixed(1)}%`
 }
 
-function money(value: number): string {
-  const abs = Math.abs(value)
-  if (abs >= 1000) return `${value < 0 ? "-" : "+"}$${(abs / 1000).toFixed(2)}k`
-  if (abs >= 1) return `${value < 0 ? "-" : "+"}$${abs.toFixed(2)}`
-  return `${value < 0 ? "-" : "+"}$${abs.toFixed(4)}`
+function shortRef(ref: string, width = 26): string {
+  return ref.length > width ? `…${ref.slice(-(width - 1))}` : ref.padEnd(width)
 }
 
-function shortRef(ref: string): string {
-  return ref.length > 38 ? `…${ref.slice(-37)}` : ref
+type Price = { ref: string; provider: string; pricePerMTok: number }
+
+function priceOf(model: any): { ref: string; provider: string; pricePerMTok: number } {
+  const provider = String(model?.providerID ?? model?.provider?.id ?? "?")
+  const id = String(model?.id ?? model?.modelID ?? "")
+  const ref = model?.id ?? (id ? `${provider}/${id}` : "")
+  const tiers: any[] = Array.isArray(model?.cost) ? model.cost : []
+  const tier = tiers[0]
+  const input = Number(tier?.input ?? 0)
+  const output = Number(tier?.output ?? 0)
+  const pricePerMTok =
+    Number.isFinite(input) && Number.isFinite(output) ? (input + output) / 2 : 0
+  return { ref, provider, pricePerMTok }
+}
+
+function priceLabel(price: number): string {
+  if (price <= 0) return "free"
+  if (price >= 100) return `$${price.toFixed(0)}/MTok`
+  return `$${price.toFixed(2)}/MTok`
 }
 
 export default Plugin.define({
   id: `${PLUGIN_ID}-tui`,
   async setup(ctx: Context) {
-    const { ui, storage, keymap, data } = ctx
+    const { ui, keymap, data } = ctx
     const location = () => ctx.location ?? data.location.default()
 
     // ---------------------------------------------------------------- state
 
-    // UI-local settings mirror the bridge so toggles survive reloads; the
-    // bridge file is the source of truth the server reads.
     let bridge: BridgeState = readBridge()
     let lastMtime = 0
     try {
@@ -94,9 +105,8 @@ export default Plugin.define({
 
     // -------------------------------------------------- savings attribution
 
-    // For each pick we remember the family cost when it happened; any later
-    // cost delta in that family multiplied by (1 - price ratio) is the
-    // counterfactual saving of having picked the cheaper model.
+    // Family cost deltas after each pick, scaled by (1 - price ratio) vs the
+    // lane's default model, become the pick's counterfactual saving.
     const baselines = new Map<number, number>()
 
     const attributeCosts = () => {
@@ -141,7 +151,107 @@ export default Plugin.define({
       onCleanup(() => clearInterval(timer))
     })
 
-    // ------------------------------------------------------------ commands
+    // --------------------------------------------------------------- widgets
+
+    const savedTotal = () =>
+      bridge.decisions.reduce((sum: number, d: BridgeDecision) => sum + (d.saved ?? 0), 0)
+
+    // Right sidebar: occupancy only — one status line plus the last pick.
+    ui.slot({
+      append: "sidebar.content",
+      render: () => {
+        void version()
+        const theme = ctx.theme
+        const base = theme?.text?.base
+        const muted = theme?.text?.muted
+        const accent = theme?.hue?.accent?.[200] ?? base
+        const last = bridge.decisions[0]
+        const saved = savedTotal()
+        return (
+          <box flexDirection="column" gap={0}>
+            <text fg={base} attributes={TextAttributes.BOLD}>
+              {`JEV ${bridge.enabled ? "ON" : "OFF"} · ${bridge.decisions.length} picks`}
+            </text>
+            <Show when={last} fallback={<text fg={muted}>waiting for a delegated task</text>}>
+              {(pick: () => BridgeDecision) => (
+                <text fg={base}>
+                  {`${shortRef(pick().model, 20)} ${(pick().probability * 100).toFixed(0)}% ${bar(
+                    pick().probability,
+                    MINI_BAR_WIDTH,
+                  )}`}
+                </text>
+              )}
+            </Show>
+            <Show when={last?.lane}>
+              <text fg={muted}>{`lane ${last!.lane}`}</text>
+            </Show>
+            <text fg={saved >= 0 ? accent : muted} attributes={TextAttributes.BOLD}>
+              {`saved $${saved.toFixed(4)}`}
+            </text>
+          </box>
+        )
+      },
+    })
+
+    // Full history body, shared by the session panel and the route page.
+    const historyBody = () => (
+      <box flexDirection="column" gap={1}>
+        <Show
+          when={bridge.decisions.length > 0}
+          fallback={<text fg={ctx.theme?.text?.muted}>No JEV decisions recorded yet.</text>}
+        >
+          <For each={bridge.decisions.slice(0, 60)}>
+            {(decision: BridgeDecision) => (
+              <box flexDirection="column">
+                <text fg={ctx.theme?.text?.base}>
+                  {`${bar(decision.probability)} ${pct(decision.probability)}  ${shortRef(decision.model, 30)}`}
+                </text>
+                <text fg={ctx.theme?.text?.muted}>
+                  {[
+                    decision.reason,
+                    decision.lane ? `lane ${decision.lane}` : "",
+                    decision.backend,
+                    new Date(decision.ts).toLocaleTimeString(),
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </text>
+              </box>
+            )}
+          </For>
+        </Show>
+      </box>
+    )
+
+    // Session panel — mounted only while a panel is open, so gate on the
+    // selected name the host passes in.
+    ui.slot({
+      append: "session.panel",
+      render: (panel: PanelInput) => (
+        <Show when={panel.name === PANEL_NAME}>
+          <box flexDirection="column" gap={1}>
+            <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
+              {`JEV history · saved $${savedTotal().toFixed(4)}`}
+            </text>
+            {historyBody()}
+          </box>
+        </Show>
+      ),
+    })
+
+    const unregisterRoute = ui.router.register({
+      name: "history",
+      render: () => (
+        <box flexDirection="column" gap={1}>
+          <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
+            JEV decision history
+          </text>
+          {historyBody()}
+        </box>
+      ),
+    })
+
+    // -------------------------------------------------------------- commands
 
     const commands = () => [
       {
@@ -175,29 +285,29 @@ export default Plugin.define({
             ui.toast.show({ title: "JEV", message: "no models available", variant: "warning" })
             return
           }
-          const allow = async () => {
+          const prices = models.map(priceOf)
+          const allow = () => {
             const raw = (readBridge().settings?.allowlist as string[] | undefined) ?? []
-            return raw.length ? raw : models.map((m: any) => m.id ?? `${m.providerID}/${m.modelID}`)
+            return raw.length ? new Set(raw) : new Set(prices.map((p) => p.ref))
           }
-          const selected = new Set(await allow())
           ui.dialog.show(() => (
             <ModelPicker
-              models={models}
-              selected={selected}
+              models={prices}
+              selected={allow()}
               onDone={(next) => {
                 bridge = readBridge()
                 bridge.settings = {
                   ...bridge.settings,
-                  allowlist: next.length === models.length ? [] : next,
+                  allowlist: next.size === prices.length ? [] : [...next],
                 }
                 persist()
                 bump()
                 ui.dialog.clear()
                 ui.toast.show({
                   title: "JEV",
-                  message: next.length === models.length
+                  message: next.size === prices.length
                     ? "considering all models"
-                    : `considering ${next.length} model(s)`,
+                    : `considering ${next.size} model(s)`,
                   variant: "success",
                 })
               }}
@@ -254,182 +364,157 @@ export default Plugin.define({
             return
           }
           const opened = ui.panel.open(PANEL_NAME)
-          if (!opened) {
-            ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
-          }
+          if (!opened) ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
         },
       },
     ]
 
-    // mode "global" keeps the commands reachable while the palette itself
-    // pushes its "modal" mode (a base-only layer would be unreachable).
+    // mode "global" keeps commands reachable while the palette pushes "modal".
     keymap.layer(() => ({
       mode: "global",
       commands: commands(),
     }))
 
-    // -------------------------------------------------------------- widgets
-
-    const lastPick = (): BridgeDecision | undefined => bridge.decisions[0]
-
-    const savedTotal = () =>
-      bridge.decisions.reduce((sum: number, d: BridgeDecision) => sum + (d.saved ?? 0), 0)
-
-    ui.slot({
-      append: "sidebar.content",
-      render: ({ sessionID }) => {
-        void version()
-        const theme = ctx.theme
-        const muted = theme?.text?.muted
-        const base = theme?.text?.base
-        const accent = theme?.hue?.accent?.[200] ?? base
-        const last = lastPick()
-        const saved = savedTotal()
-        return (
-          <box flexDirection="column" gap={1}>
-            <text fg={base} attributes={TextAttributes.BOLD}>
-              {`JEV ${bridge.enabled ? "ON" : "OFF"}`}
-            </text>
-            <Show when={last} fallback={<text fg={muted}>no picks yet</text>}>
-              {(pick: () => BridgeDecision) => (
-                <>
-                  <text fg={base}>{`picked ${shortRef(pick().model)}`}</text>
-                  <text fg={accent}>{`${bar(pick().probability)} ${pct(pick().probability)}`}</text>
-                  <Show when={pick().lane}>
-                    <text fg={muted}>{`lane: ${pick().lane}`}</text>
-                  </Show>
-                </>
-              )}
-            </Show>
-            <Show when={saved !== 0}>
-              <text fg={saved > 0 ? accent : muted}>{`saved ~${money(saved)}`}</text>
-            </Show>
-            <text fg={muted}>{`session ${sessionID.slice(0, 8)}`}</text>
-          </box>
-        )
-      },
-    })
-
-    const historyBody = () => (
-      <box flexDirection="column" gap={1}>
-        <Show
-          when={bridge.decisions.length > 0}
-          fallback={<text fg={ctx.theme?.text?.muted}>No JEV decisions recorded yet.</text>}
-        >
-          <For each={bridge.decisions.slice(0, 60)}>
-            {(decision: BridgeDecision) => (
-              <box flexDirection="column">
-                <text fg={ctx.theme?.text?.base}>
-                  {`${bar(decision.probability)} ${pct(decision.probability)}  ${shortRef(decision.model)}`}
-                </text>
-                <text fg={ctx.theme?.text?.muted}>
-                  {[
-                    decision.reason,
-                    decision.lane ? `lane ${decision.lane}` : "",
-                    decision.backend,
-                    new Date(decision.ts).toLocaleTimeString(),
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </text>
-              </box>
-            )}
-          </For>
-        </Show>
-      </box>
-    )
-
-    // Session panel: mounted by the host while a panel is open, so gate every
-    // render on the selected panel name (the host sets panel.name).
-    ui.slot({
-      append: "session.panel",
-      render: (panel: PanelInput) => (
-        <Show when={panel.name === PANEL_NAME}>
-          <box flexDirection="column" gap={1}>
-            <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
-              {`JEV history — saved ~${money(savedTotal())}`}
-            </text>
-            {historyBody()}
-          </box>
-        </Show>
-      ),
-    })
-
-    const unregisterRoute = ui.router.register({
-      name: "history",
-      render: () => (
-        <box flexDirection="column" gap={1}>
-          <text fg={ctx.theme?.text?.base} attributes={TextAttributes.BOLD}>
-            JEV decision history
-          </text>
-          {historyBody()}
-        </box>
-      ),
-    })
-
     // ------------------------------------------------------------- picker UI
 
     function ModelPicker(props: {
-      models: readonly any[]
+      models: readonly Price[]
       selected: Set<string>
-      onDone: (next: string[]) => void
+      onDone: (next: Set<string>) => void
     }) {
-      const refs = () =>
-        props.models.map((m: any) => m.id ?? `${m.providerID}/${m.modelID}`)
+      type Row =
+        | { kind: "provider"; provider: string; refs: string[]; selectedCount: number }
+        | { kind: "model"; ref: string; provider: string; pricePerMTok: number }
+
+      const providers = [...new Set(props.models.map((p) => p.provider))].sort()
+      const rows: Row[] = []
+      for (const provider of providers) {
+        const refs = props.models.filter((p) => p.provider === provider).map((p) => p.ref)
+        rows.push({ kind: "provider", provider, refs, selectedCount: refs.length })
+      }
+      // Provider headers first (stable order), models listed under theirs.
+      const ordered: Row[] = []
+      for (const header of rows) {
+        const refs = (header as { refs: string[] }).refs
+        ordered.push(header)
+        for (const ref of refs) {
+          const entry = props.models.find((p) => p.ref === ref)!
+          ordered.push({ kind: "model", ref, provider: entry.provider, pricePerMTok: entry.pricePerMTok })
+        }
+      }
+
       const [cursor, setCursor] = createSignal(0)
       const [chosen, setChosen] = createSignal(new Set(props.selected))
-      const theme = ctx.theme
+      const [freeOnly, setFreeOnly] = createSignal(false)
+      let beforeFreeOnly = new Set(props.selected)
+      const freeRefs = props.models.filter((p) => p.pricePerMTok <= 0).map((p) => p.ref)
+      const refWidth = Math.min(34, Math.max(...props.models.map((p) => p.ref.length)) + 1)
+
+      const toggleRow = () => {
+        const row = ordered[cursor()]
+        if (!row) return
+        if (row.kind === "provider") {
+          setChosen((prev) => {
+            const next = new Set(prev)
+            const allOn = row.refs.every((ref) => next.has(ref))
+            for (const ref of row.refs) {
+              if (allOn) next.delete(ref)
+              else next.add(ref)
+            }
+            return next
+          })
+          return
+        }
+        if (freeOnly() && row.pricePerMTok > 0) {
+          ui.toast.show({ title: "JEV", message: "free-only is ON — paid models locked", variant: "warning" })
+          return
+        }
+        setChosen((prev) => {
+          const next = new Set(prev)
+          if (next.has(row.ref)) next.delete(row.ref)
+          else next.add(row.ref)
+          return next
+        })
+      }
+
       keymap.layer(() => ({
         mode: "global",
         commands: [
           { bind: "up", run: () => setCursor((i) => Math.max(0, i - 1)) },
-          { bind: "down", run: () => setCursor((i) => Math.min(refs().length - 1, i + 1)) },
+          { bind: "down", run: () => setCursor((i) => Math.min(ordered.length - 1, i + 1)) },
+          { bind: "space", run: toggleRow },
           {
-            bind: "space",
+            bind: "f",
             run: () => {
-              const ref = refs()[cursor()]
-              setChosen((prev) => {
-                const next = new Set(prev)
-                if (next.has(ref)) next.delete(ref)
-                else next.add(ref)
-                return next
+              setFreeOnly((on) => {
+                if (on) {
+                  setChosen(new Set(beforeFreeOnly))
+                  return false
+                }
+                beforeFreeOnly = new Set(chosen())
+                setChosen(new Set(freeRefs))
+                return true
               })
             },
           },
           {
-            bind: "return",
-            run: () => props.onDone([...chosen()]),
+            bind: "a",
+            run: () => {
+              setChosen((prev) =>
+                prev.size === props.models.length
+                  ? new Set<string>()
+                  : new Set(props.models.map((p) => p.ref)),
+              )
+            },
           },
-          {
-            bind: "escape",
-            run: () => ui.dialog.clear(),
-          },
+          { bind: "return", run: () => props.onDone(chosen()) },
+          { bind: "escape", run: () => ui.dialog.clear() },
         ],
       }))
+
       const visible = () => {
-        const height = ctx.renderer.height ?? 24
-        const start = Math.max(0, Math.min(cursor() - Math.floor(height / 2), refs().length - height + 2))
-        const end = Math.min(refs().length, start + height - 4)
-        return refs()
-          .map((ref: string, index: number) => ({ ref, index }))
-          .slice(start, Math.max(end, start + 1))
+        const height = (ctx.renderer.height ?? 24) - 6
+        const start = Math.max(
+          0,
+          Math.min(cursor() - Math.floor(height / 2), Math.max(0, ordered.length - height)),
+        )
+        return ordered.slice(start, start + height).map((row, offset) => ({ row, index: start + offset }))
       }
+
+      const theme = ctx.theme
+      const base = theme?.text?.base
+      const muted = theme?.text?.muted
+      const accent = theme?.hue?.accent?.[200] ?? base
+
       return (
         <box flexDirection="column" gap={0}>
-          <text fg={theme?.text?.base} attributes={TextAttributes.BOLD}>
-            {`Models JEV may consider (${chosen().size}/${refs().length})`}
+          <text fg={base} attributes={TextAttributes.BOLD}>
+            {`Models JEV may consider — ${chosen().size}/${props.models.length}`}
+          </text>
+          <text fg={muted}>
+            {`up/down move · space toggle · f free-only: ${freeOnly() ? "ON" : "OFF"} · a all/none · enter save · esc cancel`}
           </text>
           <For each={visible()}>
-            {({ ref, index }: { ref: string; index: number }) => (
-              <text
-                fg={index === cursor() ? theme?.hue?.accent?.[200] ?? theme?.text?.base : theme?.text?.muted}
-                attributes={index === cursor() ? TextAttributes.BOLD : TextAttributes.NONE}
-              >
-                {`${chosen().has(ref) ? "[x]" : "[ ]"} ${shortRef(ref)}`}
-              </text>
-            )}
+            {({ row, index }: { row: Row; index: number }) => {
+              const active = index === cursor()
+              const fg = active ? accent : base
+              if (row.kind === "provider") {
+                const count = row.refs.filter((ref) => chosen().has(ref)).length
+                return (
+                  <text fg={fg} attributes={TextAttributes.BOLD}>
+                    {`▾ ${row.provider.padEnd(refWidth)} ${count}/${row.refs.length}`}
+                  </text>
+                )
+              }
+              const mark = chosen().has(row.ref) ? "[x]" : "[ ]"
+              const price = priceLabel(row.pricePerMTok).padStart(12)
+              return (
+                <text fg={fg}>
+                  {`  ${mark} ${row.ref.padEnd(refWidth)} ${price}`}
+                </text>
+              )
+            }}
           </For>
-          <text fg={theme?.text?.muted}>space toggle · enter save · esc cancel</text>
         </box>
       )
     }

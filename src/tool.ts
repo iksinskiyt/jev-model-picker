@@ -54,6 +54,59 @@ export function formatPick(pick: {
   return lines.join("\n");
 }
 
+/**
+ * Footer appended to a delegated tool's result so the probability bar shows
+ * up in the session transcript right where the delegation happened.
+ */
+export function formatPickFooter(
+  pick: {
+    ref: string;
+    probability?: number;
+    margin?: number;
+    reason?: string;
+    backend: string;
+    latencyMs?: number;
+  },
+  extra?: { lane?: string; defaultModel?: string; ratio?: number },
+): string {
+  const probability = pick.probability ?? 0;
+  const details: string[] = [];
+  if (pick.reason) details.push(pick.reason);
+  if (extra?.lane) details.push(`lane ${extra.lane}`);
+  if (extra?.defaultModel) details.push(`default ${extra.defaultModel}`);
+  if (extra?.ratio !== undefined && Number.isFinite(extra.ratio)) {
+    details.push(`${(extra.ratio * 100).toFixed(0)}% of default price`);
+  }
+  if (pick.backend) details.push(pick.backend);
+  if (pick.latencyMs) details.push(`${pick.latencyMs}ms`);
+  return [
+    "---",
+    `JEV picked ${pick.ref}`,
+    `${probabilityBar(probability, 24)} ${(probability * 100).toFixed(1)}%` +
+      (pick.margin !== undefined ? ` (margin ${pick.margin.toFixed(2)})` : ""),
+    details.join(" · "),
+  ].join("\n");
+}
+
+/** Append text to a tool result, handling string or Content[] shapes. */
+export function appendToolResultText(result: any, text: string): void {
+  try {
+    if (!result || typeof result !== "object") return;
+    const content = result.content;
+    if (typeof content === "string") {
+      result.content = content ? `${content}\n\n${text}` : text;
+      return;
+    }
+    if (Array.isArray(content)) {
+      result.content = [...content, { type: "text", text }];
+      return;
+    }
+    result.content = text;
+  } catch {
+    // never break a tool result
+  }
+}
+
 export async function registerPickTools(
   ctx: any,
   runtime: PickerRuntime,
