@@ -131,8 +131,8 @@ export default Plugin.define({
       append: "session.panel",
       render: (input) => {
         const s = state()
-        const last = s.decisions[0]
-        const saved = s.decisions.reduce((sum, d) => sum + (d.costDelta || 0), 0)
+        const last: Decision | undefined = s.decisions[0]
+        const saved = s.decisions.reduce((sum: number, d: Decision) => sum + (d.costDelta || 0), 0)
         const lines: string[] = []
         lines.push(`JEV ${s.enabled ? "ON" : "OFF"}`)
         if (last) {
@@ -157,7 +157,7 @@ export default Plugin.define({
       render: () => {
         const s = state()
         const lines = s.decisions.map(
-          (d) => `${bar(d.probability)} ${(d.probability * 100).toFixed(0)}%  ${d.model}  ${d.reason}`,
+          (d: Decision) => `${bar(d.probability)} ${(d.probability * 100).toFixed(0)}%  ${d.model}  ${d.reason}`,
         )
         return {
           type: "div",

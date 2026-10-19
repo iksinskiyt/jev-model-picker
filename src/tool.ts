@@ -38,17 +38,17 @@ export function probabilityBar(fraction: number, width = 20): string {
  */
 export function formatPick(pick: {
   ref: string;
-  probability: number;
-  margin: number;
-  reason: string;
+  probability?: number;
+  margin?: number;
+  reason?: string;
   backend: string;
   latencyMs?: number;
 }): string {
-  const pct = (pick.probability * 100).toFixed(1);
+  const pct = ((pick.probability ?? 0) * 100).toFixed(1);
   const lines = [
     `JEV picked ${pick.ref}`,
-    `${probabilityBar(pick.probability)} ${pct}%  (margin ${pick.margin.toFixed(2)})`,
-    `reason: ${pick.reason}`,
+    `${probabilityBar(pick.probability ?? 0)} ${pct}%  (margin ${(pick.margin ?? 0).toFixed(2)})`,
+    `reason: ${pick.reason ?? "(none given)"}`,
     `backend: ${pick.backend}${pick.latencyMs ? ` · ${pick.latencyMs}ms` : ""}`,
   ];
   return lines.join("\n");
@@ -112,7 +112,7 @@ export async function registerPickTools(
         const lanes = runtime.laneNames();
         const pins = lanes.map((l: string) => {
           const pin = runtime.lanePin(l);
-          return pin ? `${l}: ${pin.ref}` : `${l}: (none)`;
+          return pin ? `${l}: ${pin}` : `${l}: (none)`;
         });
         return {
           content: [

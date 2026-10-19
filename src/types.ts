@@ -83,6 +83,7 @@ export interface PickResult {
   reason?: string;
   backend: string;
   latencyMs: number;
+  costDelta?: number;
 }
 
 export interface DecisionLogEntry {
