@@ -387,6 +387,15 @@ export default Plugin.define({
         },
       },
       {
+        id: `${PLUGIN_ID}.panel`,
+        title: "JEV: status panel",
+        description: "Side panel: is JEV working, and the last delegated prompt",
+        group: "JEV",
+        palette: true as const,
+        slash: { name: "jev-panel" },
+        run: openPanel,
+      },
+      {
         id: `${PLUGIN_ID}.history`,
         title: "JEV: decision history",
         group: "JEV",
