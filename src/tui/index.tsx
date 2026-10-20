@@ -11,22 +11,23 @@ import type { BridgeDecision, BridgeState } from "../bridge"
  *
  * - session transcript: a probability bar footer per delegation (src/hook.ts)
  * - right sidebar: ONE row in OpenCode's sidebar design language — status
- *   glyph on the left, bold "JEV" label, muted status, plus a muted "saved"
- *   line. Glyphs follow OMO-Slim: braille spinner while working, ✦ star
- *   after a recent pick, • idle.
- * - session panel (right side): status + the last delegated prompt, full
- *   width, no models and no probabilities
- * - history subscreen: transcript-style blocks for every pick — full prompt,
- *   model, bar — inside a scrollbox; esc returns to the session
+ *   glyph on the left, bold "JEV" label, then the last delegated prompt of
+ *   THIS session as a one-liner; a muted "saved" line under it.
+ *   Glyphs follow OMO-Slim: braille spinner while working, ✦ star after a
+ *   recent pick, • idle.
+ * - session panel (right side): status + the last delegated prompt of this
+ *   session, full width — no models, no probabilities
+ *
+ * Everything shown is scoped to the current session (its root family), and
+ * the cost estimate is per session.
  */
 
 const PLUGIN_ID = "jev-model-picker"
-const PANEL_NAME = `${PLUGIN_ID}.history`
+const PANEL_NAME = `${PLUGIN_ID}.status`
 const SAVINGS_POLL_MS = 2000
 const BRIDGE_WRITE_DEBOUNCE_MS = 2000
 const ATTRIBUTION_WINDOW_MS = 30 * 60 * 1000
 const WORKING_WINDOW_MS = 60 * 1000
-const HISTORY_BAR_WIDTH = 24
 const PICKER_PAGE_ROWS = 11
 
 // Braille activity frames, same set the OMO-Slim sidebar animates.
@@ -35,30 +36,6 @@ const ACTIVITY_FRAME_MS = 80
 const STAR_GLYPH = "✦"
 const IDLE_GLYPH = "•"
 const RECENT_COLOR = "#60a5fa"
-
-// Same left rail the session transcript uses for message blocks.
-const SplitBorder = {
-  border: ["left" as const],
-  customBorderChars: {
-    topLeft: "",
-    bottomLeft: "",
-    topRight: "",
-    bottomRight: "",
-    vertical: "┃",
-    horizontal: " ",
-    bottomT: "",
-    topT: "",
-    cross: "",
-    leftT: "",
-    rightT: "",
-  },
-}
-
-function bar(fraction: number, width: number): string {
-  const value = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 0
-  const filled = Math.round(value * width)
-  return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled))
-}
 
 function clockTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
@@ -149,6 +126,8 @@ export default Plugin.define({
      * Counterfactual savings: the tokens a family burned since the last
      * measurement, priced at the lane's default model, minus what the family
      * actually paid. Free picks cost ~$0 but their avoided cost is real.
+     * Accounting is global (per decision, by timestamp); what is DISPLAYED is
+     * scoped to the current session further below.
      */
     type FamilyUsage = { tokens: number; cost: number }
     const familyUsage = new Map<string, FamilyUsage>()
@@ -168,10 +147,7 @@ export default Plugin.define({
         for (const message of data.session.message.list(id) ?? []) {
           const tokens = (message as any)?.tokens
           if (!tokens) continue
-          total +=
-            Number(tokens.input ?? 0) +
-            Number(tokens.output ?? 0) +
-            Number(tokens.reasoning ?? 0)
+          total += Number(tokens.input ?? 0) + Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0)
         }
       }
       return total
@@ -209,7 +185,6 @@ export default Plugin.define({
           cost - previous.cost,
         )
         if (gain <= 0) continue
-        // Accumulate by timestamp so concurrent server writes never lose it.
         savedByTs.set(decision.ts, (savedByTs.get(decision.ts) ?? 0) + gain)
         changed = true
       }
@@ -238,19 +213,42 @@ export default Plugin.define({
       onCleanup(() => clearInterval(timer))
     })
 
+    // ------------------------------------------------------- session scoping
+
+    /**
+     * Everything displayed is scoped to a session's root family, so the
+     * history and the cost estimate are per session — switching sessions
+     * shows that session's own picks and its own savings.
+     */
+    const sessionRoot = (sessionID: string | undefined): string | undefined => {
+      if (!sessionID) return undefined
+      try {
+        return data.session.root(sessionID)
+      } catch {
+        return sessionID
+      }
+    }
+
+    const decisionsFor = (sessionID: string | undefined): BridgeDecision[] => {
+      if (!sessionID) return []
+      const root = sessionRoot(sessionID)
+      return bridge.decisions
+        .filter((d) => d.sessionID && sessionRoot(d.sessionID) === root)
+        .sort((a, b) => b.ts - a.ts)
+    }
+
+    const savedOf = (d: BridgeDecision) => savedByTs.get(d.ts) ?? d.saved ?? 0
+    const savedFor = (sessionID: string | undefined): number =>
+      decisionsFor(sessionID).reduce((sum, d) => sum + savedOf(d), 0)
+
     // ------------------------------------------------------------ glyph logic
 
     const [now, setNow] = createSignal(Date.now())
-    const lastPick = () => bridge.decisions[0]
-    const savedOf = (d: BridgeDecision) => savedByTs.get(d.ts) ?? d.saved ?? 0
-    const savedTotal = () =>
-      bridge.decisions.reduce((sum: number, d: BridgeDecision) => sum + savedOf(d), 0)
-
-    const status = () => {
+    const statusFor = (sessionID: string | undefined) => {
       if (!bridge.enabled) {
         return { glyph: IDLE_GLYPH, color: undefined, label: "off", working: false }
       }
-      const last = lastPick()
+      const last = decisionsFor(sessionID)[0]
       if (!last) return { glyph: IDLE_GLYPH, color: undefined, label: "ready", working: false }
       if (now() - last.ts < WORKING_WINDOW_MS) {
         return {
@@ -266,8 +264,9 @@ export default Plugin.define({
     // Animate only while working, like the OMO-Slim sidebar does.
     onMount(() => {
       const timer = setInterval(() => {
-        const s = status()
-        if (s.working) setNow(Date.now())
+        const route = ui.router.current()
+        const sid = route.type === "session" ? route.sessionID : undefined
+        if (sid && statusFor(sid).working) setNow(Date.now())
       }, ACTIVITY_FRAME_MS)
       onCleanup(() => clearInterval(timer))
     })
@@ -285,18 +284,10 @@ export default Plugin.define({
       })
     }
 
-    const openHistory = () => {
-      ui.router.navigate({ type: "plugin", id: PLUGIN_ID, name: "history" })
-    }
-
     const openPanel = () => {
       const route = ui.router.current()
-      if (route.type !== "session") {
-        openHistory()
-        return
-      }
-      const opened = ui.panel.open(PANEL_NAME)
-      if (!opened) openHistory()
+      if (route.type !== "session") return false
+      return ui.panel.open(PANEL_NAME)
     }
 
     const commands = () => [
@@ -395,14 +386,6 @@ export default Plugin.define({
         slash: { name: "jev-panel" },
         run: openPanel,
       },
-      {
-        id: `${PLUGIN_ID}.history`,
-        title: "JEV: decision history",
-        group: "JEV",
-        palette: true as const,
-        slash: { name: "jev-history" },
-        run: openHistory,
-      },
     ]
 
     // mode "global" keeps commands reachable while the palette pushes "modal".
@@ -414,21 +397,22 @@ export default Plugin.define({
     // -------------------------------------------------------------- sidebar
 
     /**
-     * One row, OpenCode sidebar style: glyph on the left, bold label, muted
-     * status to the right; a muted "saved" line under it. Clicking the row
-     * opens the status panel.
+     * One row, OpenCode sidebar style: glyph on the left, bold label, and the
+     * last delegated prompt of THIS session as a one-liner; a muted per
+     * session "saved" line under it. Clicking the row opens the status panel.
      */
     ui.slot({
       append: "sidebar.content",
-      render: () => {
+      render: ({ sessionID }) => {
         void version()
         void now()
         const theme = ctx.theme
         const base = theme?.text?.base
         const muted = theme?.text?.muted
-        const s = status()
-        const saved = savedTotal()
-        const last = lastPick()
+        const s = statusFor(sessionID)
+        const saved = savedFor(sessionID)
+        const picks = decisionsFor(sessionID)
+        const last = picks[0]
         const prompt = last?.task ? oneLine(last.task) : ""
         return (
           <box flexDirection="column">
@@ -447,7 +431,9 @@ export default Plugin.define({
               <text fg={base} wrapMode="none" truncate flexGrow={1} flexShrink={1} minWidth={0}>
                 <b>JEV</b>
                 <span style={{ fg: muted }}>
-                  {` ${s.label}${prompt ? ` · ${prompt}` : !last ? "" : ` · ${clockTime(last!.ts)}`}`}
+                  {` ${s.label} · ${picks.length} picks${
+                    prompt ? ` · ${prompt}` : last ? ` · ${clockTime(last.ts)}` : ""
+                  }`}
                 </span>
               </text>
             </box>
@@ -461,108 +447,19 @@ export default Plugin.define({
       },
     })
 
-    // ---------------------------------------------------------- history UI
-
-    /**
-     * One decision as a transcript-style message block: role + time, the
-     * full delegated prompt, the model chosen, and its probability bar.
-     */
-    function historyEntry(decision: BridgeDecision) {
-      const theme = ctx.theme
-      const base = theme?.text?.base
-      const muted = theme?.text?.muted
-      const accent = theme?.hue?.accent?.[200] ?? base
-      const saved = savedOf(decision)
-      return (
-        <box {...SplitBorder} borderColor={accent} paddingLeft={1} flexDirection="column" gap={0}>
-          <text fg={base} attributes={TextAttributes.BOLD}>
-            {`▸ ${decision.lane || "delegated task"} · ${clockTime(decision.ts)}`}
-          </text>
-          <text fg={base} wrapMode="word">
-            {decision.task}
-          </text>
-          <text fg={accent} attributes={TextAttributes.BOLD}>
-            {`JEV picked ${decision.model}`}
-          </text>
-          <text fg={accent}>
-            {`${bar(decision.probability, HISTORY_BAR_WIDTH)} ${(decision.probability * 100).toFixed(1)}%`}
-          </text>
-          <Show when={decision.defaultModel}>
-            <text fg={muted}>{`default ${decision.defaultModel}`}</text>
-          </Show>
-          <Show when={saved > 0}>
-            <text fg={accent}>{`saved +$${saved.toFixed(4)} on this task`}</text>
-          </Show>
-          <text fg={muted}>{`${decision.reason || ""}${decision.backend ? ` · ${decision.backend}` : ""}`}</text>
-        </box>
-      )
-    }
-
-    // History subscreen (route page): every pick, full prompts, all bars.
-    function HistoryRoute() {
-      const theme = ctx.theme
-      keymap.layer(() => ({
-        mode: "global",
-        commands: [
-          {
-            id: `${PLUGIN_ID}.history.exit`,
-            bind: "escape",
-            title: "Back to session",
-            run: () => {
-              const last = bridge.decisions[0]
-              if (last?.sessionID) {
-                ui.router.navigate({ type: "session", sessionID: last.sessionID })
-                return
-              }
-              ui.router.navigate({ type: "home" })
-            },
-          },
-        ],
-      }))
-      return (
-        <box flexDirection="column" padding={1} gap={1}>
-          <box flexDirection="row" justifyContent="space-between">
-            <text fg={theme?.text?.base} attributes={TextAttributes.BOLD}>
-              JEV decision history
-            </text>
-            <text fg={theme?.hue?.accent?.[200] ?? theme?.text?.base} attributes={TextAttributes.BOLD}>
-              {`saved $${savedTotal().toFixed(4)}`}
-            </text>
-          </box>
-          <text fg={theme?.text?.muted}>
-            {`${bridge.decisions.length} picks · esc back to session`}
-          </text>
-          <scrollbox flexGrow={1}>
-            <box flexDirection="column" gap={1}>
-              <Show
-                when={bridge.decisions.length > 0}
-                fallback={<text fg={theme?.text?.muted}>No JEV decisions recorded yet.</text>}
-              >
-                <For each={bridge.decisions}>{(decision: BridgeDecision) => historyEntry(decision)}</For>
-              </Show>
-            </box>
-          </scrollbox>
-        </box>
-      )
-    }
-
-    const unregisterRoute = ui.router.register({
-      name: "history",
-      render: () => <HistoryRoute />,
-    })
-
-    // ---------------------------------------------------------- session UI
-
     /**
      * Session panel: status only — is JEV working, did the last pick land,
-     * and the full prompt it answered. No models, no probabilities.
+     * and the full prompt it answered (this session). No models, no bars.
      */
     function JevStatusPanel(props: { panel: PanelInput }) {
       const theme = ctx.theme
       const base = theme?.text?.base
       const muted = theme?.text?.muted
       const accent = theme?.hue?.accent?.[200] ?? base
-      const s = status()
+      const sid = props.panel.sessionID
+      const s = statusFor(sid)
+      const picks = decisionsFor(sid)
+      const last = picks[0]
       keymap.layer(() => ({
         mode: "global",
         commands: [
@@ -571,12 +468,6 @@ export default Plugin.define({
             bind: "escape",
             title: "Close JEV panel",
             run: () => props.panel.close(),
-          },
-          {
-            id: `${PLUGIN_ID}.panel.history`,
-            bind: "h",
-            title: "Full JEV history",
-            run: openHistory,
           },
         ],
       }))
@@ -588,10 +479,10 @@ export default Plugin.define({
             </text>
             <text fg={base} wrapMode="none" truncate flexGrow={1} flexShrink={1} minWidth={0}>
               <b>JEV</b>
-              <span style={{ fg: muted }}>{` ${s.label} · ${bridge.decisions.length} picks`}</span>
+              <span style={{ fg: muted }}>{` ${s.label} · ${picks.length} picks this session`}</span>
             </text>
           </box>
-          <Show when={lastPick()} fallback={<text fg={muted}>no delegated tasks yet</text>}>
+          <Show when={last} fallback={<text fg={muted}>no delegated tasks yet</text>}>
             {(pick: () => BridgeDecision) => (
               <>
                 <text fg={accent}>{`last pick ✓ ${clockTime(pick().ts)}`}</text>
@@ -603,9 +494,9 @@ export default Plugin.define({
             )}
           </Show>
           <text fg={accent} attributes={TextAttributes.BOLD}>
-            {`saved $${savedTotal().toFixed(4)}`}
+            {`saved $${savedFor(sid).toFixed(4)}`}
           </text>
-          <text fg={muted}>esc close · h full history</text>
+          <text fg={muted}>esc close · probability bars stay in the transcript</text>
         </box>
       )
     }
@@ -764,8 +655,6 @@ export default Plugin.define({
       )
     }
 
-    return () => {
-      unregisterRoute()
-    }
+    return () => {}
   },
 })
