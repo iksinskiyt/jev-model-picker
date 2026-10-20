@@ -34,6 +34,14 @@
     "llm"
   ],
   "license": "MIT",
+  "homepage": "https://github.com/iksinskiyt/jev-model-picker#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iksinskiyt/jev-model-picker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iksinskiyt/jev-model-picker/issues"
+  },
   "dependencies": {
     "@opencode/plugin": "^2.0.32"
   },
