@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/Jev-System%20One-06b6d4?style=for-the-badge" alt="Jev" />
   <img src="https://img.shields.io/badge/API%20key-not%20required-22c55e?style=for-the-badge" alt="keyless" />
   <img src="https://img.shields.io/badge/tests-56%2F56%20pass-22c55e?style=for-the-badge" alt="tests" />
-  <img src="https://img.shields.io/npm/l/jev-model-picker?style=for-the-badge" alt="license" />
+  <img src="https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge" alt="license" />
 </p>
 
 <h1 align="center">jev-model-picker</h1>
