@@ -1,97 +1,70 @@
-# Session log — 10-hour Jev improvement session
+# Session log — compaction checkpoint 2
 
-Started 2026-11-06 (user asleep). This file is the compaction checkpoint record.
-Update it whenever context is compacted, so nothing measured is lost.
+Latest commit: `f03dc5b` (pushed to `origin/main`). `bun run verify` = typecheck + **157 tests pass** + 284-module bundle.
 
-## Status: phase 1 complete and pushed (4 commits)
+---
+
+## 1. The plugin-load failure — root cause and resolution
+
+Symptom: `SyntaxError: Export named 'recordConcentration' not found in module 'src/limits.ts'`, ~35/35 load attempts.
+
+I worked the loader chain in the local source before concluding:
 
 ```
-1722674  Improve decision quality of jev-model-picker model picker
-6d55964  feat(tell): explicit substitution tell on every path, and multi-provider budget config
-ec514b9  docs: NIM quality benchmark and the final lane allocation
-645aea2  feat(sessions): session-layer interception with real payload-shape support
+packages/core/src/plugin.ts            plugin.effect(...)
+  @opencode/plugin/dist/source.bun.js  prepareSource(): walks the graph from the
+                                       entrypoint and deletes require.cache entries
+  @opencode/plugin/dist/host.js        Host.load() → importModule() → import(file://…)
 ```
-All pushed to `origin/main`. `bun test` = **156 pass / 0 fail**, `bunx tsc --noEmit` clean.
 
-## Answers to the user's six questions
+`prepareSource`'s cache invalidation is best-effort and its own comment states the weakness:
 
-**1. "Add a tell to see which model was substituted and for what model"** — DONE.
-`src/tell.ts` renders one unambiguous line, used identically by the tool-hook footer, the TUI sidebar row,
-the `/jev-sub` command, and (new) the session layer:
+> *"rejected evaluations are not enumerable, but deletion still invalidates them."*
+
+`recordConcentration` only existed in the tree between 13:00–13:44 UTC, when `catalog.ts` briefly imported it from `./limits` instead of `./optimize`. That failed the link, the rejected evaluation was cached, and the long-lived server replayed it.
+
+**Everything I could construct loaded the identical code correctly** — tsc, 156 tests, `bun build` (bun + node), `bunx esbuild --bundle`, `import(file://…)` from three cwds, and the host's *exact* `prepareSource()` invalidate-then-import sequence 3× over. No stale file, no on-disk cache, no cycle, no config pointer — each checked.
+
+Per-process log analysis was decisive: in the last 60 minutes exactly **one** process attempted to load the plugin (`run=e6222d69`, `role=server`) and it failed every time; no other role attempted it. That process had been alive 14.5 hours.
+
+**Fix: restart the OpenCode server.** Confirmed afterwards — `jev_status` returns live data and 85 load attempts, 0 failures since 20:10.
+
+*Diagnostic note*: my first failure-count was 201, which was wrong — my own Python scripts contained the literal string "failed to load plugin" and matched the host's "spawning process" log lines. Filtering on `target=` plus a real timestamp cut it to 1, which was the same artefact.
+
+## 2. Jev is now enabled — and live testing immediately found four real defects
+
+Turning it on was deliberately deferred until `optimize.ts` had landed, because before that it would have routed work to the exhausted Go plan.
+
+Live `jev_pick` results, then fixed:
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `KNOWN_EMPTY_MODELS` was keyed `nvidia/nemotron-3.5-lightning-30b-a3b`, but `getHealthModelId()` strips the doubled `nvidia/nvidia/` — so the lookup never matched and a model measured to return an **EMPTY response** kept being picked for fixer/explorer/librarian. | Rekeyed bare + regression test |
+| 2 | **No lane-pin preference in the scoring at all** — a healthy pin lost to marginally-cheaper models. | Added `pinBonus: 8`, applied only when the candidate *is* the resolved pin |
+| 3 | Jev substituted healthy pins at **12–15% confidence**. | Confidence floor: decline below 34% (`MIN_SUBSTITUTION_CONFIDENCE`, overridable by `policy.minProbability`); an unhealthy/exhausted pin is still overridden |
+| 4 | `nemotron-3-super-120b-a12b` (not served to this account) was picked for oracle — it is one `.` away from the working observer pin `nemotron-3.5-**super-vl**-120b-a12b`. | Added to the dark list with an explicit comment about the trap |
+
+Also: `filterDarkModels` now drops **degraded** as well as dark models (an empty response is a task that silently did no work, not a penalty), while still returning them when nothing healthy remains, so never-block holds.
+
+### Verified in-process, not just asserted
+A throwaway probe ran `listCandidates` against a realistic NIM catalog for all seven lanes and printed the ranking. After the fixes every lane's pin ranks #1 and the degraded model is absent from all seven lanes. (The probe also caught a *test-fixture* error of mine — doubled ids produced triple-prefixed refs that silently disabled the pin bonus, which is why the first run looked wrong.)
+
+## 3. Live picks after the fixes
+
 ```
-JEV · fixer · SUBSTITUTED opencode-go/claude-haiku-5-5 → opencode-go/deepseek-v4.1-flash
-    · deep bucket, cheap per task · 80%
+fixer     → (declines; keeps the healthy pin)
+explorer  → nemotron-3-nano-omni (which IS the explorer pin)
+oracle    → nemotron-3-super-120b-a12b @43% (above the floor — bad pick, now excluded)
+librarian → nemotron-3-super-120b-a12b @15% (below the floor — blocked)
 ```
-A decline renders `PIN KEPT …` so it never reads as a substitution. Truncation raised 30→48 chars because
-at 30 the model refs were being cut in half, which defeated the purpose.
 
-**2. "Make sure the substitution works"** — the interception surface is now proven, not assumed:
-- `@opencode/protocol/dist/groups/event.d.ts:8959-9069` declares `session.created` with
-  `data.{sessionID, parentID, agent, model:{providerID,id,variant}, title}`.
-- OMO-Slim's own consumer (`index.js:82962`) does `event.data ?? event.properties ?? event` and reads
-  `parentID`/`agent`/`model` with **no foreground/background filter**.
-- OMO-Slim's own `switchModel` call sites (`index.js:81931-81934`, `84373-84376`) confirm the exact shape
-  `switchModel({ sessionID, model: { providerID, id } })` — which is what `src/sessions.ts` calls.
-- **Live proof it fires**: the bridge state contained 4 `session-layer` decisions recorded from *real
-  background* `subagent(...)` dispatches, each with the correct lane and the lane's pin as `defaultModel`.
-- 11 session-layer tests lock both the V2 (`data.*`) and legacy V1 (`properties.info.*`) payload shapes, so
-  a host rename fails a test instead of failing silently.
-- **Still open**: billing ground truth. All 4 observed child sessions were aborted before their first
-  assistant turn, so no usage row exists yet to confirm which model was charged. TODO for a live run.
+`librarian` still returned a pick despite being under the floor at the time of that test; the server had not yet reloaded the newest edit. Since then `nemotron-3-super-120b-a12b` has been added to the dark list, so that specific bad outcome is now unreachable.
 
-**3. "Go tracking optional + more provider options"** — DONE.
-`src/providers.ts` registry with fail-soft `readUsage()` adapters: OpenRouter (`GET /api/v1/key` →
-`limit_remaining`/`limit_reset`), Anthropic (`anthropic-ratelimit-*` response headers), GitHub Copilot
-(`GET /copilot_internal/user` → `quota_snapshots`), OpenCode Go (session DB), plus Together/Fireworks/OpenAI
-stubs and **Zen/NIM marked manual** (no endpoint exists → they can never be budget-tracked and must never
-withhold a pick). `budget.provider` accepts any programmable id or `auto`; unknown values fall back to
-`auto` rather than silently pinning Go.
+## 4. Open item — flaky test
 
-**4. "Optimize the work given all resources"** — DONE in code, with the key finding being that the
-optimisation target was wrong. Measured:
-- Every model actually used in the last 7 days is `opencode/*-free` or `nvidia/*`; total cost `$0.00`.
-  Jev was picking `opencode-go/*` — a plan whose premium model measured **$1125.53 used vs a $30 cap**.
-- cache-read dominates: fixer **47.8M cacheRead vs 1.5M input = 32×**.
-- 46.8M of that came from ONE model → single point of failure.
-`src/optimize.ts` now ranks by cache-read cost (not input price), excludes known-dark endpoints, penalises
-latency for high-volume lanes, reserves premium models for hard tasks, caps any model at 2 lanes, and
-understands off-peak pricing. 10 scenario tests assert it does *not* pick the dark/exhausted/expensive option.
+Two test runs failed (~1 in 8, runtime 20s vs the usual 2.4s, consistent with a timeout). It has **not reproduced in 17 consecutive runs** (12 × `bun test`, 5 × `bun run verify`). Not yet identified — needs a run that captures the failure text; the earlier attempts captured neither the name nor a summary.
 
-**5. Council agents** — they were **my addition**, not a Jev feature, and they were assigned to
-`opencode-go/*` while the active preset was `nim`, so they pointed at a dead plan. Re-pointed at verified NIM
-models (0 `opencode-go` refs left in the council block). Not used during this session, per your instruction.
-The token-harnessing rules are written up in `docs/token-harnessing.md` as a standalone publishable playbook.
-
-**6. Notes in MD + compaction discipline** — `docs/FINDINGS.md` (append-only evidence log), this file,
-`docs/budget-providers.md`, `docs/token-harnessing.md`.
-
-## Also fixed (defects found along the way)
-- `src/sessions.ts`: `stopped` was declared inside a block whose `return` sat outside it → the disposer
-  threw `ReferenceError`. Fixed.
-- Objective field was `description`/`label`/`objective`; the real field is **`data.title`**. Fixed, with a
-  flattener for both event shapes.
-- **Tests were writing into the user's live `~/.config/opencode/jev-model-picker/state.json`.** Tests now
-  point `JEV_MODEL_PICKER_STATE` at a throwaway dir; verified the live `rev` no longer moves.
-- `tsconfig.json` had `"DOM"` added to `lib` to hide three real type errors in `providers.ts`
-  (`{} has no .get()`, wrong Anthropic header names, untyped `resp.json()`). Reverted the hack, fixed the code.
-- `tell.ts`'s `substitutionFromDecision` put a *model ref* (`lanePin`) into the *lane* field. Fixed.
-- 13 `errors*.txt` + `test-output.txt` + a half-written `src/config.ts.new` left by the subagents — removed.
-
-## Subagent claims that did NOT survive verification (checked, not trusted)
-- Lane B reported "1 pre-existing failure in `test/little.test.ts`" — **that file does not exist**. The real
-  suite was 102/0.
-- Lane A reported "tsc clean" — it was not; 3 errors remained, hidden by the DOM hack.
-- Lane A and B reported committing — **neither had committed**; everything was still in the working tree.
-- Lane B wrote `src/config.ts.new` because an edit failed mid-write, leaving `config.ts` correct and the
-  `.new` file broken debris.
-- Lane C touched `src/types.ts` despite being told not to (benign additive type; accepted after review).
-
-## Still TODO
-1. **Billing ground truth for the session-layer substitution** — run a real background delegation and read
-   `session_v2.model` + `tokens_*` to prove `switchModel` landed.
-2. **Enable Jev.** Currently `enabled: false` in the bridge state (last real decision Oct 20). Deliberately
-   NOT enabled yet: before the optimisation landed, Jev would have routed to the dead Go plan, which is the
-   opposite of the goal. Now that `optimize.ts` excludes it, enabling is the next step.
-3. Consider whether `zen-free` preset's `opencode/glm-5.3-flash-free` should be benchmarked too — it is a
-   *different* provider from NIM's `z-ai/glm-5.3-flash` and was working in the DB, so it may be a better
-   home for those lanes than NIM.
+## 5. Still open
+- **Billing ground truth**: all observed background child sessions were aborted before their first assistant turn, so no `session_v2` usage row confirms which model `switchModel` actually put on the wire. TODO for a live delegation.
+- **Budget provider is still `go`** — and Go is dead. Every live pick is a free-tier NIM model, so `budget.provider: "auto"` (or a NIM-aware setting) would describe reality better. Not changed yet because it alters live behaviour.
+- `opencode/glm-5.3-flash-free` (OpenCode's own free tier — a *different* provider from NIM) was working in the DB and may suit those lanes better than NIM. Could not be tested from this host (HTTP 403).
