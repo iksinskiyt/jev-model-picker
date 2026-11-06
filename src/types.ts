@@ -168,3 +168,11 @@ export interface DecisionLogEntry {
   budgetSkipped?: string[];
   error?: string;
 }
+
+/** Observed per-agent demand, averaged over that agent's completed work. */
+export interface DemandProfile {
+  tasks: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+}

@@ -3,6 +3,7 @@ import type {
   BudgetSnapshot,
   Candidate,
   ChatBackendConfig,
+  DemandProfile,
   LaneInfo,
   PickResult,
   PickerConfig,
@@ -11,7 +12,7 @@ import { digestTask } from "./digest";
 import { callSystemOne } from "./systemone";
 import { callChat } from "./chat";
 import { decideChat, decideSystemOne } from "./policy";
-import { listCandidates } from "./catalog";
+import { listCandidates, OptimizeContext } from "./catalog";
 import { loadOmoslim } from "./omoslim";
 import { logDecision } from "./log";
 import { resolveProviderKey } from "./creds";
@@ -25,8 +26,8 @@ import {
   partitionByTaskFit,
   readDemandByAgent,
   resolveBudgetPolicy,
-  type DemandProfile,
 } from "./limits";
+import { getGlobalConcentration } from "./catalog";
 
 export function buildQuestions(
   candidates: Candidate[],
@@ -117,6 +118,7 @@ export class PickerRuntime {
   async candidatesFor(
     lane?: string,
     allowlist?: string[],
+    optimizeCtx?: OptimizeContext,
   ): Promise<Candidate[]> {
     return listCandidates(
       this.ctx,
@@ -124,6 +126,7 @@ export class PickerRuntime {
       lane,
       this.lanePin(lane),
       allowlist,
+      optimizeCtx,
     );
   }
 
@@ -266,45 +269,52 @@ export class PickerRuntime {
     const errors: string[] = [];
 
     try {
-      candidates = await this.candidatesFor(
-        lane,
-        allowlist && allowlist.length ? allowlist : undefined,
-      );
-
-      // Live plan budgets: annotate every candidate, then withhold the ones
-      // whose allowance cannot absorb another task of this size. When nothing
-      // has room we offer everything and let the picker choose (a starved pick
-      // still beats falling back to a model that is also exhausted).
+      // --- Budget snapshot & demand profile (needed for optimization context) ---
       let snapshot: BudgetSnapshot | undefined;
-      let tasksLeft: Map<string, number> | undefined;
+      let profile: DemandProfile | undefined;
       if (budgetPolicy.enabled) {
         try {
           snapshot = await budgetSnapshot({ plan: budgetPolicy.plan });
         } catch {
           snapshot = undefined;
         }
-        for (const c of candidates) c.budget = budgetFor(snapshot, c.ref);
-      }
-
-      // Observed per-lane demand: how big a task like this usually is, so
-      // "remaining budget" can be expressed in tasks the model can still run.
-      let profile: DemandProfile | undefined;
-      if (budgetPolicy.enabled && budgetPolicy.capacityAware) {
-        try {
-          const demand = await readDemandByAgent();
-          profile = demand[lane ?? ""] ?? averageDemand(Object.values(demand));
-        } catch {
-          profile = undefined;
+        if (budgetPolicy.capacityAware) {
+          try {
+            const demand = await readDemandByAgent();
+            profile = demand[lane ?? ""] ?? averageDemand(Object.values(demand));
+          } catch {
+            profile = undefined;
+          }
         }
       }
 
+      // --- Evidence-based optimization context ---
+      const optimizeCtx: OptimizeContext = {
+        taskDigest: digest,
+        budgetSnapshot: snapshot,
+        budgetPolicy,
+        demandProfile: profile,
+        concentration: getGlobalConcentration(),
+        // timeWindow, weights, now use defaults from optimize.ts
+      };
+
+      candidates = await this.candidatesFor(
+        lane,
+        allowlist && allowlist.length ? allowlist : undefined,
+        optimizeCtx,
+      );
+
+      // Annotate candidates with budget info for the picker backend
+      for (const c of candidates) c.budget = budgetFor(snapshot, c.ref);
+
+      // Partition by task fit (capacity-aware budget filtering)
       const { preferred, tight, tasksLeft: left } = partitionByTaskFit(
         candidates,
         snapshot,
         budgetPolicy,
         profile,
       );
-      tasksLeft = left;
+      const tasksLeft = left;
       if (preferred.length >= 2) {
         offered = preferred;
         budgetSkipped = tight.map((c) => c.ref);

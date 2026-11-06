@@ -1,4 +1,18 @@
 import type { Candidate, PickerConfig } from "./types";
+import {
+  rankCandidates,
+  filterDarkModels,
+  modelHealth,
+  latencyFor,
+  DEFAULT_WEIGHTS,
+  DEFAULT_TIME_WINDOW,
+  createConcentrationMap,
+  ConcentrationMap,
+  classifyTaskComplexity,
+  isOffPeak,
+  recordConcentration,
+} from "./optimize";
+import { bareModel } from "./limits";
 
 const EXCLUDE_ID = /(embed|rerank|guard|safety|moderation)/i;
 
@@ -18,12 +32,50 @@ export function blendedPrice(costArr: readonly any[]): number {
 }
 
 /**
+ * Default concentration map — in practice this should be shared across picks
+ * to track cross-lane concentration. For now, each pick gets a fresh map.
+ * TODO: persist concentration state in bridge/settings.
+ */
+let globalConcentration: ConcentrationMap = createConcentrationMap();
+
+export function getGlobalConcentration(): ConcentrationMap {
+  return globalConcentration;
+}
+
+export function resetGlobalConcentration(): void {
+  globalConcentration = createConcentrationMap();
+}
+
+/**
+ * Optimization context for evidence-based candidate ranking.
+ */
+export interface OptimizeContext {
+  /** Task digest text for complexity classification. */
+  taskDigest?: string;
+  /** Live budget snapshot for exhaustion checks. */
+  budgetSnapshot?: import("./types").BudgetSnapshot;
+  /** Budget policy for capacity-aware filtering. */
+  budgetPolicy?: import("./types").BudgetPolicy;
+  /** Per-lane demand profile for cost estimation. */
+  demandProfile?: import("./types").DemandProfile;
+  /** Concentration map for anti-concentration (shared across picks). */
+  concentration?: ConcentrationMap;
+  /** Time window config for off-peak pricing. */
+  timeWindow?: import("./optimize").TimeWindowConfig;
+  /** Scoring weights (defaults to evidence-tuned values). */
+  weights?: import("./optimize").ScoringWeights;
+  /** Current timestamp for off-peak calculation. */
+  now?: number;
+}
+
+/**
  * Build the candidate list offered to the picker for a given lane.
  *
  * - Auto: every enabled, tool-capable model from ctx.model.list()
  * - Lane pin (from OMO-Slim) is sorted first so criteria skew toward it
  * - Explicit config.lanes[lane] refs win when they resolve; if fewer than 2
  *   resolve (e.g. stale pins) we fall back to auto-discovery
+ * - Evidence-based ranking: health, cache-read cost, latency, concentration, premium reservation, off-peak
  */
 export async function listCandidates(
   ctx: any,
@@ -31,6 +83,7 @@ export async function listCandidates(
   lane?: string,
   lanePin?: string,
   allowlist?: string[],
+  optimizeCtx?: OptimizeContext,
 ): Promise<Candidate[]> {
   let models: any[] = [];
   try {
@@ -92,8 +145,46 @@ export async function listCandidates(
       .filter((c): c is Candidate => !!c);
   }
 
-  if (list === all && lanePin) {
-    // pinned model first, everything else keeps catalog order
+  // Evidence-based ranking when optimization context is provided
+  if (optimizeCtx) {
+    const {
+      taskDigest = "",
+      budgetSnapshot,
+      budgetPolicy,
+      demandProfile,
+      concentration = globalConcentration,
+      timeWindow = DEFAULT_TIME_WINDOW,
+      weights = DEFAULT_WEIGHTS,
+      now = Date.now(),
+    } = optimizeCtx;
+
+    const offPeak = isOffPeak(now, timeWindow);
+    const taskComplexity = classifyTaskComplexity(taskDigest, lane ?? "unknown", demandProfile);
+
+    // Filter dark models (but keep if only options — never-block)
+    list = filterDarkModels(list, lanePin);
+
+    // Rank by evidence-based scoring
+    const ranked = rankCandidates(list, {
+      weights,
+      offPeak,
+      taskComplexity,
+      concentration,
+      lane: lane ?? "unknown",
+      demandProfile,
+      budgetSnapshot,
+      budgetPolicy: budgetPolicy ?? cfg.budget,
+    });
+
+    list = ranked.map((r) => r.candidate);
+
+    // Record concentration for picked model (top-ranked) — best effort
+    if (list.length > 0 && lane) {
+      const topBare = bareModel(list[0].ref);
+      recordConcentration(concentration, lane, topBare);
+    }
+  } else if (list === all && lanePin) {
+    // Legacy: pinned model first, everything else keeps catalog order
     list = [...all].sort(
       (a, b) => (a.ref === lanePin ? -1 : 0) - (b.ref === lanePin ? -1 : 0),
     );
