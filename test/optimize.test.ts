@@ -98,33 +98,47 @@ describe("latencyFor", () => {
 });
 
 describe("isOffPeak", () => {
-  test("default window: 00:00-08:00 UTC is off-peak", () => {
-    // 2026-11-06 04:00 UTC = off-peak
-    const offPeakTime = Date.UTC(2026, 10, 6, 4, 0, 0);
-    expect(isOffPeak(offPeakTime, DEFAULT_TIME_WINDOW)).toBe(true);
+  // 2026-11-06 is a Friday; 2026-11-07 Saturday; 2026-11-08 Sunday; 2026-11-09 Monday.
+  test("default window matches the documented DeepSeek peak hours (Mon-Fri)", () => {
+    // Peak: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri only.
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 1, 0, 0), DEFAULT_TIME_WINDOW)).toBe(false); // Fri 01:00 peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 3, 59, 0), DEFAULT_TIME_WINDOW)).toBe(false); // Fri 03:59 peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 4, 0, 0), DEFAULT_TIME_WINDOW)).toBe(true); // Fri 04:00 off-peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 6, 0, 0), DEFAULT_TIME_WINDOW)).toBe(false); // Fri 06:00 peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 10, 0, 0), DEFAULT_TIME_WINDOW)).toBe(true); // Fri 10:00 off-peak
   });
 
-  test("default window: 08:00-24:00 UTC is peak", () => {
-    const peakTime = Date.UTC(2026, 10, 6, 12, 0, 0);
-    expect(isOffPeak(peakTime, DEFAULT_TIME_WINDOW)).toBe(false);
+  test("weekends are always off-peak, even during peak hours", () => {
+    expect(isOffPeak(Date.UTC(2026, 10, 7, 2, 0, 0), DEFAULT_TIME_WINDOW)).toBe(true); // Sat 02:00
+    expect(isOffPeak(Date.UTC(2026, 10, 8, 8, 0, 0), DEFAULT_TIME_WINDOW)).toBe(true); // Sun 08:00
   });
 
-  test("custom window crossing midnight", () => {
-    const cfg: TimeWindowConfig = { offPeakStart: 22, offPeakEnd: 6, tzOffsetMinutes: 0 };
-    expect(isOffPeak(Date.UTC(2026, 10, 6, 23, 0, 0), cfg)).toBe(true); // 23:00
-    expect(isOffPeak(Date.UTC(2026, 10, 7, 3, 0, 0), cfg)).toBe(true); // 03:00
-    expect(isOffPeak(Date.UTC(2026, 10, 6, 12, 0, 0), cfg)).toBe(false); // 12:00
+  test("a Monday peak hour is still peak", () => {
+    expect(isOffPeak(Date.UTC(2026, 10, 9, 2, 0, 0), DEFAULT_TIME_WINDOW)).toBe(false); // Mon 02:00
   });
 
-  test("timezone offset shifts the window", () => {
-    // UTC-5 (EST): window is 00:00-08:00 EST = 05:00-13:00 UTC
-    const cfg: TimeWindowConfig = { offPeakStart: 0, offPeakEnd: 8, tzOffsetMinutes: -300 };
-    // 09:00 UTC = 04:00 EST -> off-peak
-    expect(isOffPeak(Date.UTC(2026, 10, 6, 9, 0, 0), cfg)).toBe(true);
-    // 13:00 UTC = 08:00 EST -> peak (boundary)
-    expect(isOffPeak(Date.UTC(2026, 10, 6, 13, 0, 0), cfg)).toBe(false);
-    // 04:00 UTC = 23:00 EST (previous day) -> peak
-    expect(isOffPeak(Date.UTC(2026, 10, 6, 4, 0, 0), cfg)).toBe(false);
+  test("custom windows may cross midnight", () => {
+    const cfg: TimeWindowConfig = {
+      peakWindows: [[22, 6]],
+      peakWeekdaysOnly: false,
+      tzOffsetMinutes: 0,
+    };
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 23, 0, 0), cfg)).toBe(false); // 23:00 = peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 3, 0, 0), cfg)).toBe(false); // 03:00 = peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 12, 0, 0), cfg)).toBe(true); // 12:00 = off-peak
+  });
+
+  test("timezone offset shifts which UTC hours count as peak", () => {
+    // tzOffsetMinutes as documented: applied before reading UTC fields.
+    const cfg: TimeWindowConfig = {
+      peakWindows: [[1, 4]],
+      peakWeekdaysOnly: false,
+      tzOffsetMinutes: -300, // UTC-5
+    };
+    // 06:00 UTC + (-300min) = 01:00 -> peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 6, 0, 0), cfg)).toBe(false);
+    // 10:00 UTC + (-300min) = 05:00 -> off-peak
+    expect(isOffPeak(Date.UTC(2026, 10, 6, 10, 0, 0), cfg)).toBe(true);
   });
 });
 
@@ -134,12 +148,20 @@ describe("effectivePrice", () => {
     expect(price).toEqual({ input: 0.15, output: 0.6, cacheRead: 0.003 });
   });
 
-  test("returns base pricing for deepseek-v4.1-flash during peak", () => {
+  test("returns peak pricing for deepseek-v4.1-flash during peak", () => {
     const price = effectivePrice("deepseek-v4.1-flash", false);
-    // Base price from MODEL_PRICES
-    expect(price?.input).toBe(0.15);
-    expect(price?.output).toBe(0.6);
-    expect(price?.cacheRead).toBe(0.003);
+    // Base (peak) price from the Go docs: $0.30/$1.20/$0.006 — 2x off-peak.
+    expect(price?.input).toBe(0.3);
+    expect(price?.output).toBe(1.2);
+    expect(price?.cacheRead).toBe(0.006);
+  });
+
+  test("peak costs twice off-peak for deepseek-v4.1-flash", () => {
+    const off = effectivePrice("deepseek-v4.1-flash", true);
+    const peak = effectivePrice("deepseek-v4.1-flash", false);
+    expect(peak!.input / off!.input).toBe(2);
+    expect(peak!.output / off!.output).toBe(2);
+    expect(peak!.cacheRead / off!.cacheRead).toBe(2);
   });
 
   test("returns undefined for unknown models", () => {

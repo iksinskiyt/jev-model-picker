@@ -49,6 +49,73 @@ OpenCode's `nvidia` provider lists model ids **with a duplicated org prefix**: `
 Both forms have been observed landing on real child sessions, so the host normalises — but the **double form is the
 literal catalog ref** and is the safer one to write. All substitutions above use the double form.
 
+## Authoritative source: https://opencode.ai/docs/console/go/#how-it-works
+
+Read in full 2026-11-06. Supersedes the spreadsheet guesses below where they differ.
+
+**Plan price** (the spreadsheet has no notion of this): Go **$10/mo**, Go Plus **$40/mo**, Go Teams **$20/member**.
+The per-model "Monthly limit" figures are *included usage*, not the subscription price — they deliberately exceed
+the plan price for bulk-discounted models.
+
+**Window caps** (per model, authoritative):
+- 5-hour window = **20%** of the monthly limit
+- weekly window = **50%**
+- monthly = 100%
+Each response reports what the request cost as `opencode.allowance`
+(https://opencode.ai/console/api/inference#cost) — this is the live-usage feed the budget layer should read.
+
+**DeepSeek peak hours** (the plugin previously guessed `00:00-08:00 UTC`):
+> "Peak hours are 01:00-04:00 and 06:00-10:00 UTC, Monday through Friday; all other hours, including
+> weekends, are Off-Peak."
+
+So peak is **two disjoint windows**, **weekday-only**. `TimeWindowConfig` was reshaped from a single
+start/end pair into `peakWindows: Array<[start,end]>` + `peakWeekdaysOnly`, because one contiguous range cannot
+express this.
+
+**Endpoint** (previously assumed unreachable — it is not):
+`https://opencode.ai/inference/go/openai/v1/chat/completions`, plus native endpoints per model
+(Anthropic-style `/anthropic/v1/messages` for Claude Haiku 5.5, MiniMax M3, Qwen3.7/3.8; Google-style for
+Gemini 4 Argon; `/openai/v1/responses` for Grok 4.7, GPT Luna, Muse Spark, Crouton, Beam). Bearer key from
+the OpenCode Console, connected via `/connect`.
+
+**Per-request token assumptions used in the doc's own request estimates** — these are the best available proxy
+for "how much context a lane actually drags", and they confirm cache-read dominance across the board:
+
+| Model | input | **cached read** | output |
+|---|---|---|---|
+| Claude Haiku 5.5 | 1,100 | **55,000** | 240 |
+| GPT 6 Luna | 1,000 | **50,000** | 220 |
+| Kimi K3.1 Pro | 1,050 | **76,500** | 300 |
+| MiMo-V2.6-Flash | 830 | **71,500** | 295 |
+| DeepSeek V4.1 Flash | 410 | **71,300** | 310 |
+| Muse Spark 1.3 | 620 | **71,400** | 300 |
+| GLM-5.3-Flash | 1,000 | **55,000** | 200 |
+| Qwen3.8 Max | 420 | **66,000** | 200 |
+
+**Estimated requests/month on the Go plan** (the capacity number that actually matters for a lane):
+
+| Model | requests/5h | requests/month | × Claude Haiku |
+|---|---|---|---|
+| Muse Spark 1.3 | 45,300 | 226,600 | 11.8× |
+| DeepSeek V4.1 Flash | 43,330 | 216,670 | 11.3× |
+| MiMo-V2.6-Flash | 30,100 | 150,400 | 7.8× |
+| GLM-5.3-Flash | 6,320 | 31,580 | 1.6× |
+| GPT 6 Luna | 4,230 | 21,130 | 1.1× |
+| **Claude Haiku 5.5** | 3,850 | **19,230** | 1.0× |
+| Qwen3.8 Max | 160 | 810 | 0.04× |
+| Kimi K3.1 Pro | 147 | 735 | 0.04× |
+
+This is the direct answer to "is Claude Haiku 5.5 good for fixer": **no** — it is the *worst* value on the list
+among models that could do the job, with MiMo-V2.6-Flash offering 7.8× the monthly request capacity and
+Muse Spark 1.3 offering 11.8×.
+
+**Restricted models** (a config trap, not a pricing one): DeepSeek V4.1/V4 Pro need **Global** under
+Settings→Privacy→Regions, and Muse Spark 1.3/1.2 need **"allow paid endpoints that train on request data"**
+enabled. Both are off by default, so these models fail at request time rather than at subscribe time.
+
+**Extra Usage**: reaching a limit blocks by default, but Go can fall back to a pay-as-you-go Console balance
+if enabled. Go Teams has it on by default.
+
 ## Budget research table (user's `Documents/opencode go.xlsx`, 39 models)
 
 Has: USD/MTok input, output, cached-read, cached-write; monthly USD allowance per model; and the derived

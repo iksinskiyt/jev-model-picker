@@ -60,8 +60,12 @@ export const MODEL_PRICES: Record<string, ModelPrice> = {
   "qwen3.8-max": { input: 2.0, output: 6.0, cacheRead: 0.25 },
   "qwen3.8-flash": { input: 0.15, output: 0.47, cacheRead: 0.016 },
   "qwen3.7-plus": { input: 0.4, output: 1.6, cacheRead: 0.04 },
-  "deepseek-v4.1-flash": { input: 0.15, output: 0.6, cacheRead: 0.003 },
-  "deepseek-v4-pro": { input: 0.66, output: 1.98, cacheRead: 0.022 },
+  // DeepSeek base = PEAK pricing. Off-peak is the discount, applied by
+  // effectivePrice() when the schedule says so. These two were previously
+  // identical, which meant DeepSeek was costed at off-peak rates around the
+  // clock and looked 2x cheaper than it is during peak hours.
+  "deepseek-v4.1-flash": { input: 0.3, output: 1.2, cacheRead: 0.006 },
+  "deepseek-v4-pro": { input: 1.32, output: 3.96, cacheRead: 0.044 },
   hy4: { input: 0.834, output: 2.501, cacheRead: 0.042 },
   "hy4-preview": { input: 0.834, output: 2.501, cacheRead: 0.042 },
   hy3: { input: 0.14, output: 0.58, cacheRead: 0.035 },

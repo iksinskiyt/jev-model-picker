@@ -92,31 +92,52 @@ export function latencyFor(bareId: string): number {
   return MODEL_LATENCY[bareId] ?? DEFAULT_LATENCY_S;
 }
 
-/** Peak/off-peak window configuration. */
+/**
+ * Peak/off-peak window configuration.
+ *
+ * Authoritative source — https://opencode.ai/docs/console/go/#how-it-works:
+ *   "DeepSeek V4.1 Flash / V4 Pro: Peak hours are 01:00-04:00 and 06:00-10:00
+ *    UTC, Monday through Friday; all other hours, including weekends, are
+ *    Off-Peak."
+ *
+ * So peak is *two disjoint windows* and *weekday-only*. A single contiguous
+ * start/end pair cannot express that, which is why this takes a window list.
+ */
 export interface TimeWindowConfig {
-  /** Off-peak start hour (UTC), inclusive. Default 0 (midnight). */
-  offPeakStart: number;
-  /** Off-peak end hour (UTC), exclusive. Default 8 (8 AM). */
-  offPeakEnd: number;
-  /** Timezone offset in minutes from UTC. Default 0 (UTC). */
+  /** Peak windows as [startHourUtc, endHourUtc); ranges may be disjoint. */
+  peakWindows: ReadonlyArray<readonly [number, number]>;
+  /** When true, Sat/Sun are always off-peak regardless of the hour. */
+  peakWeekdaysOnly: boolean;
+  /** Offset in minutes applied before reading UTC fields (for tests/local). */
   tzOffsetMinutes: number;
 }
 
 export const DEFAULT_TIME_WINDOW: TimeWindowConfig = {
-  offPeakStart: 0, // 00:00 UTC
-  offPeakEnd: 8, // 08:00 UTC
+  peakWindows: [
+    [1, 4],
+    [6, 10],
+  ],
+  peakWeekdaysOnly: true,
   tzOffsetMinutes: 0,
 };
 
-/** Check if current time is in off-peak window. */
-export function isOffPeak(now: number = Date.now(), cfg: TimeWindowConfig = DEFAULT_TIME_WINDOW): boolean {
+/** True when `now` falls in the off-peak window (i.e. NOT peak). */
+export function isOffPeak(
+  now: number = Date.now(),
+  cfg: TimeWindowConfig = DEFAULT_TIME_WINDOW,
+): boolean {
   const d = new Date(now + cfg.tzOffsetMinutes * 60_000);
   const hour = d.getUTCHours();
-  if (cfg.offPeakStart < cfg.offPeakEnd) {
-    return hour >= cfg.offPeakStart && hour < cfg.offPeakEnd;
-  }
-  // Window crosses midnight
-  return hour >= cfg.offPeakStart || hour < cfg.offPeakEnd;
+  const weekday = d.getUTCDay(); // 0 = Sunday … 6 = Saturday
+
+  // Weekends are always off-peak when the schedule is weekday-only.
+  if (cfg.peakWeekdaysOnly && (weekday === 0 || weekday === 6)) return true;
+
+  const inPeak = cfg.peakWindows.some(([start, end]) => {
+    if (start < end) return hour >= start && hour < end;
+    return hour >= start || hour < end; // window crosses midnight
+  });
+  return !inPeak;
 }
 
 /** Models with distinct off-peak pricing (from FINDINGS.md budget research). */
