@@ -25,9 +25,16 @@ export const KNOWN_BAD_MODELS = new Set<string>([
   "z-ai/glm-5.3", // HTTP 410 EOL
 ]);
 
-/** Models that returned empty responses — treat as unhealthy. */
+/**
+ * Models that returned empty responses — treat as unhealthy.
+ *
+ * Keyed by the BARE NIM id (no `nvidia/` prefix), because that is what
+ * `getHealthModelId` returns after stripping the doubled `nvidia/nvidia/` from
+ * an OpenCode ref. Keying it with the prefix silently matches nothing, which is
+ * exactly how this entry stopped filtering for a while.
+ */
 export const KNOWN_EMPTY_MODELS = new Set<string>([
-  "nvidia/nemotron-3.5-lightning-30b-a3b", // returns EMPTY response — unusable
+  "nemotron-3.5-lightning-30b-a3b", // returns EMPTY response — unusable
 ]);
 
 /** Health status for a model. */
@@ -138,6 +145,12 @@ export interface ScoringWeights {
   premiumPenalty: number;
   /** Weight for off-peak bonus. */
   offPeakBonus: number;
+  /**
+   * Bonus for matching the lane's configured pin. The pin is a deliberate
+   * configuration choice (often benchmarked by hand), so a healthy pin beats a
+   * marginally-cheaper alternative unless the evidence is clearly against it.
+   */
+  pinBonus: number;
 }
 
 export const DEFAULT_WEIGHTS: ScoringWeights = {
@@ -150,6 +163,9 @@ export const DEFAULT_WEIGHTS: ScoringWeights = {
   concentrationWeight: 5, // Per additional lane on same model
   premiumPenalty: 10, // For ordinary tasks on premium models
   offPeakBonus: 2, // Small bonus for off-peak pricing
+  // Big enough that a healthy pin beats a free-but-marginal alternative, small
+  // enough that a genuinely unhealthy pin still loses to a healthy model.
+  pinBonus: 8,
 };
 
 /** Task complexity heuristic — determines if work is "ordinary" or "hard". */
@@ -228,6 +244,8 @@ export interface ScoreBreakdown {
   concentration: number;
   premium: number;
   offPeak: number;
+  /** Bonus for matching the lane's configured pin (0 when it is not the pin). */
+  pin: number;
 }
 
 export function scoreCandidate(
@@ -241,6 +259,8 @@ export function scoreCandidate(
     demandProfile: DemandProfile | undefined;
     budgetSnapshot: BudgetSnapshot | undefined;
     budgetPolicy: BudgetPolicy;
+    /** The lane's configured pin, when it resolved to a live candidate. */
+    lanePin?: string;
   },
 ): ScoreBreakdown {
   const bare = bareModel(candidate.ref);
@@ -298,6 +318,14 @@ export function scoreCandidate(
     offPeakScore = opts.weights.offPeakBonus;
   }
 
+  // --- Lane pin prior ---
+  // The pin is what the operator configured for this lane, frequently after
+  // benchmarking by hand. Matching it is evidence, not a tie-break.
+  let pinScore = 0;
+  if (opts.lanePin && candidate.ref === opts.lanePin) {
+    pinScore = opts.weights.pinBonus;
+  }
+
   // --- Budget exhaustion check (hard constraint) ---
   if (opts.budgetSnapshot && opts.budgetPolicy.enabled) {
     const budgetInfo = budgetFor(opts.budgetSnapshot, candidate.ref);
@@ -307,7 +335,14 @@ export function scoreCandidate(
     }
   }
 
-  const total = costScore + latencyScore + healthScore + concentrationScore + premiumScore + offPeakScore;
+  const total =
+    costScore +
+    latencyScore +
+    healthScore +
+    concentrationScore +
+    premiumScore +
+    offPeakScore +
+    pinScore;
 
   return {
     total,
@@ -317,6 +352,7 @@ export function scoreCandidate(
     concentration: concentrationScore,
     premium: premiumScore,
     offPeak: offPeakScore,
+    pin: pinScore,
   };
 }
 
@@ -351,15 +387,27 @@ export function rankCandidates(
 /** Budget info helper (re-exported for convenience). */
 import { budgetFor } from "./limits";
 
-/** Filter out dark models unless they're the only option (never-block). */
+/**
+ * Filter out unusable models — dark (unreachable) *and* degraded (answers with
+ * an empty response) — unless they are the only option. Never-block: with
+ * nothing healthy left the pin still wins.
+ *
+ * Degraded models are excluded rather than penalised on purpose. An empty
+ * response is not "slightly worse", it is a task that silently did no work, so
+ * a minus-point penalty is not enough — it must be out of reach whenever a
+ * healthy alternative exists.
+ */
 export function filterDarkModels(
   candidates: Candidate[],
   lanePin?: string,
 ): Candidate[] {
-  const healthy = candidates.filter((c) => modelHealth(getHealthModelId(c.ref)) !== "dark");
+  const healthy = candidates.filter((c) => {
+    const h = modelHealth(getHealthModelId(c.ref));
+    return h !== "dark" && h !== "degraded";
+  });
   if (healthy.length >= 2) return healthy;
   if (healthy.length === 1) return healthy;
-  // Only dark models available — keep them all (never-block: pin will win anyway)
+  // Only unusable models available — keep them all rather than return nothing.
   return candidates;
 }
 

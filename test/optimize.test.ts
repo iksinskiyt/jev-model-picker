@@ -38,7 +38,18 @@ describe("Known bad/empty models", () => {
   });
 
   test("KNOWN_EMPTY_MODELS contains models returning empty responses", () => {
-    expect(KNOWN_EMPTY_MODELS.has("nvidia/nemotron-3.5-lightning-30b-a3b")).toBe(true);
+    // Keyed by the BARE id, which is what getHealthModelId() returns after
+    // stripping the doubled "nvidia/nvidia/" prefix off an OpenCode ref.
+    expect(KNOWN_EMPTY_MODELS.has("nemotron-3.5-lightning-30b-a3b")).toBe(true);
+  });
+
+  test("a degraded model is excluded even behind a doubled ref prefix", () => {
+    // Regression: this set was once keyed with the "nvidia/" prefix, so the
+    // health lookup (which strips it) never matched and a model that returns an
+    // EMPTY response kept being picked for fixer and explorer.
+    const ref = "nvidia/nemotron-3.5-lightning-30b-a3b";
+    expect(getHealthModelId(ref)).toBe("nemotron-3.5-lightning-30b-a3b");
+    expect(modelHealth(getHealthModelId(ref))).toBe("degraded");
   });
 
   test("modelHealth returns dark for known bad bare IDs", () => {
@@ -48,7 +59,7 @@ describe("Known bad/empty models", () => {
   });
 
   test("modelHealth returns degraded for known empty bare IDs", () => {
-    expect(modelHealth("nvidia/nemotron-3.5-lightning-30b-a3b")).toBe("degraded");
+    expect(modelHealth("nemotron-3.5-lightning-30b-a3b")).toBe("degraded");
   });
 });
 
@@ -60,7 +71,7 @@ describe("modelHealth", () => {
   });
 
   test("returns degraded for known-empty models", () => {
-    expect(modelHealth("nvidia/nemotron-3.5-lightning-30b-a3b")).toBe("degraded");
+    expect(modelHealth("nemotron-3.5-lightning-30b-a3b")).toBe("degraded");
   });
 
   test("returns healthy for unknown models", () => {
@@ -214,7 +225,7 @@ describe("scoreCandidate", () => {
 
   test("degraded models get strong penalty", () => {
     // Real NIM ref format for Lightning model
-    const degraded = makeCandidate("nvidia/nvidia/nvidia/nemotron-3.5-lightning-30b-a3b");
+    const degraded = makeCandidate("nvidia/nvidia/nemotron-3.5-lightning-30b-a3b");
     const healthy = makeCandidate("nvidia/nvidia/nemotron-3-ultra-550b-a55b");
     const degradedScore = scoreCandidate(degraded, baseOpts);
     const healthyScore = scoreCandidate(healthy, baseOpts);

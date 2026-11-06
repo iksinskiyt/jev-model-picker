@@ -77,7 +77,7 @@ const mockCtx = {
       // Empty response model
       {
         providerID: "nvidia",
-        id: "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+        id: "nvidia/nemotron-3.5-lightning-30b-a3b",
         name: "Nemotron 3.5 Lightning",
         cost: [{ input: 0, output: 0 }],
         limit: { context: 128_000 },
@@ -178,7 +178,7 @@ function createTestPicker(overrides: Partial<Parameters<typeof resolveConfig>[0]
 
       // Pick the first healthy non-dark candidate
       const darkRefs = ["z-ai/glm-5.3-flash", "deepseek-ai/deepseek-v4.1-flash", "z-ai/glm-5.3"];
-      const emptyRefs = ["nvidia/nemotron-3.5-lightning-30b-a3b"];
+      const emptyRefs = ["nemotron-3.5-lightning-30b-a3b"];
       const pickRef = candidateRefs.find(
         (ref: string) => !darkRefs.some((d) => ref.includes(d)) && !emptyRefs.some((e) => ref.includes(e))
       ) ?? candidateRefs[0];
@@ -429,7 +429,7 @@ describe("Decision quality — evidence-based picker behavior", () => {
       });
 
       const refs = candidates.map((c) => c.ref);
-      const lightningIdx = refs.indexOf("nvidia/nvidia/nvidia/nemotron-3.5-lightning-30b-a3b");
+      const lightningIdx = refs.indexOf("nvidia/nvidia/nemotron-3.5-lightning-30b-a3b");
       const ultraIdx = refs.indexOf("nvidia/nvidia/nemotron-3-ultra-550b-a55b");
 
       if (lightningIdx >= 0 && ultraIdx >= 0) {

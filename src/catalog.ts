@@ -161,7 +161,7 @@ export async function listCandidates(
     const offPeak = isOffPeak(now, timeWindow);
     const taskComplexity = classifyTaskComplexity(taskDigest, lane ?? "unknown", demandProfile);
 
-    // Filter dark models (but keep if only options — never-block)
+    // Filter unusable models (dark + degraded) — never-block keeps the pin
     list = filterDarkModels(list, lanePin);
 
     // Rank by evidence-based scoring
@@ -174,6 +174,7 @@ export async function listCandidates(
       demandProfile,
       budgetSnapshot,
       budgetPolicy: budgetPolicy ?? cfg.budget,
+      lanePin,
     });
 
     list = ranked.map((r) => r.candidate);
