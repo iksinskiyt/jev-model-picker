@@ -20,7 +20,9 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "probe": "bun run scripts/probe.ts"
+    "probe": "bun run scripts/probe.ts",
+    "build-check": "bun build src/index.ts --target=bun --outfile dist/verify-bundle.js && node -e \"require('fs').rmSync('dist/verify-bundle.js')\"",
+    "verify": "bun run typecheck && bun run test && bun run build-check"
   },
   "keywords": [
     "opencode",
