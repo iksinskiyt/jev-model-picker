@@ -5,6 +5,12 @@ import { createSignal, For, Show, onCleanup, onMount } from "solid-js"
 import { TextAttributes } from "@opentui/core"
 import { counterfactualGain, readBridge, writeBridge } from "../bridge"
 import type { BridgeDecision, BridgeState } from "../bridge"
+import type { Substitution } from "../tell"
+import {
+  formatSubstitution,
+  summarizeSubstitutions,
+  substitutionFromDecision,
+} from "../tell"
 import {
   budgetSnapshot,
   DEFAULT_BUDGET_POLICY,
@@ -96,6 +102,10 @@ export default Plugin.define({
     let bridge: BridgeState = readBridge()
     const savedByTs = new Map<number, number>()
 
+    // Track recent substitutions from bridge decisions
+    const [recentSub, setRecentSub] = createSignal<Substitution | null>(null)
+    const [subHistory, setSubHistory] = createSignal<Substitution[]>([])
+
     const [version, setVersion] = createSignal(0)
     const bump = () => setVersion((v) => v + 1)
 
@@ -105,6 +115,16 @@ export default Plugin.define({
         if (fresh.rev === bridge.rev) return
         bridge = fresh
         bump()
+        // Compute substitutions from the new bridge decisions.
+        const decisions: BridgeDecision[] = fresh.decisions
+        // substitutionFromDecision reads the lane and the pin off the decision
+        // itself — passing a settings value here would put a model ref in the
+        // lane field.
+        const history = decisions
+          .map((d) => substitutionFromDecision(d))
+          .filter((s) => s.source !== "preset-kept") // keep only actual substitutions
+        setSubHistory(history)
+        setRecentSub(history.length > 0 ? history[0] : null)
       } catch {
         // ignore
       }
@@ -428,11 +448,33 @@ export default Plugin.define({
           commit((state) => {
             state.settings = settings
           })
+          // Build toast message with optional substitution tell
+          const sub = recentSub()
+          const subInfo = sub
+            ? ` · substituted ${sub.from.slice(0, 15)} → ${sub.to.slice(0, 15)}`
+            : ""
           ui.toast.show({
             title: "JEV",
-            message: `budget: plan ${settings.budget ? (settings.budget as any).plan : "?"} · floor $${(settings.budget as any).floorUsd ?? "default"}`,
+            message: `budget: plan ${settings.budget ? (settings.budget as any).plan : "?"} · floor $${(settings.budget as any).floorUsd ?? "default"}${subInfo}`,
             variant: "success",
           })
+        },
+      },
+      {
+        id: `${PLUGIN_ID}.sub`,
+        title: "JEV: substitution history",
+        description: "List recent model substitutions with reasons",
+        group: "JEV",
+        palette: true as const,
+        slash: { name: "jev-sub" },
+        run: async () => {
+          const history = subHistory()
+          if (history.length === 0) {
+            ui.toast.show({ title: "JEV", message: "No substitutions recorded yet", variant: "info" })
+            return
+          }
+          const summary = summarizeSubstitutions(history)
+          ui.toast.show({ title: "JEV substitutions", message: summary, variant: "success" })
         },
       },
       {
@@ -530,6 +572,12 @@ export default Plugin.define({
                 </span>
               </text>
             </box>
+            {/* SUBSTITUTION TELL — most recent from → to */}
+            <Show when={recentSub() !== null}>
+              <text fg={muted} wrapMode="none" truncate flexShrink={0}>
+                {`· ${recentSub()!.from} → ${recentSub()!.to}`}
+              </text>
+            </Show>
             <Show when={saved > 0}>
               <text fg={muted} wrapMode="none" truncate flexShrink={0}>
                 {`saved $${saved.toFixed(4)}`}

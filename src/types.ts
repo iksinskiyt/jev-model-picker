@@ -2,6 +2,8 @@
  * Core shared types for jev-model-picker.
  */
 
+import type { ProgrammaticProvider } from "./providers";
+
 export interface SystemOneBackendConfig {
   kind: "systemone";
   /** Base URL ending in /v1, e.g. https://opencode.ai/inference/systemone/v1 */
@@ -56,6 +58,18 @@ export interface BudgetPolicy {
   capacityAware: boolean;
   /** How many more such tasks a model must be able to absorb. */
   minTasks: number;
+  /**
+   * Which provider to read live budget data from.
+   *
+   * `"auto"` (default) uses whichever configured provider can actually be read
+   * right now. A named provider pins the source, so a user on e.g. OpenRouter
+   * forces their OpenRouter quota to be the constraint instead of Go's.
+   * Providers with no readable endpoint (Zen, NIM) can never be pinned — they
+   * simply impose no constraint.
+   */
+  provider?: "auto" | ProgrammaticProvider;
+  /** Optional explicit API key for OpenRouter (resolved from auth if omitted). */
+  openrouterKey?: string;
 }
 
 /** Live budget picture for one capped model. */
@@ -90,6 +104,9 @@ export interface PolicyConfig {
   /** Reuse a pick for identical (lane, digest) within this window. */
   cacheTtlMs: number;
 }
+
+/** Budget configuration per-provider (see providers.ts for full definition). */
+export type { BudgetConfig } from "./providers";
 
 export interface PickerConfig {
   enabled: boolean;

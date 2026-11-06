@@ -3,6 +3,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BudgetInfo, BudgetPolicy, BudgetSnapshot, PlanId } from "./types";
 
+import {
+  ProviderId,
+  ProgrammaticProvider,
+  ManualProvider,
+  isProgrammaticProvider,
+  isManualProvider,
+  findAdapter,
+} from "./providers";
+
 /**
  * Plan-aware budgeting.
  *
@@ -180,14 +189,34 @@ export function planEntry(
   ref: string,
 ): { limitUsd: number; price: ModelPrice } | undefined {
   const bare = bareModel(ref);
-  const limit = PLAN_LIMITS[plan]?.[bare];
+  if (!bare) return undefined;
   const price = MODEL_PRICES[bare];
-  if (limit === undefined || !price) return undefined;
-  // A provider-qualified ref only counts when it names Go. The same bare id on
-  // NIM/Console is pay-as-you-go and has no shared bucket to keep track of.
+  if (!price) return undefined;
+
   const provider = providerOf(ref);
-  if (provider && provider !== GO_PROVIDER) return undefined;
-  return { limitUsd: limit, price };
+
+  // Go plans (go, go-plus, go-teams): only models qualified with the
+  // OpenCode Go provider draw from the shared monthly bucket.
+  if (PLAN_IDS.includes(plan)) {
+    const limit = PLAN_LIMITS[plan]?.[bare];
+    if (limit === undefined) return undefined;
+    // Only Go-capped models qualify for Go plans.
+    if (provider && provider !== GO_PROVIDER) return undefined;
+    return { limitUsd: limit, price };
+  }
+
+  // Non-Go plans: look up from the provider registry.
+  // Currently no other plan tables are registered; this infrastructure
+  // is in place for future expansion (e.g. OpenRouter, Anthropic plans).
+  const prov = ProviderId[provider as keyof typeof ProviderId];
+  if (prov) {
+    // Placeholder: return undefined for non-Go providers until plan
+    // limit tables are registered per provider.
+    return undefined;
+  }
+
+  // Ref has no recognised provider — treat as uncapped.
+  return undefined;
 }
 
 /** True when the ref belongs to a Go-capped family. */
@@ -224,6 +253,9 @@ export function windowCap(
   const share = window === "month" ? 1 : window === "week" ? 0.5 : 0.2;
   return limitUsd * share;
 }
+
+/** Programmeable provider whose adapter will supply live usage, or "go" for the session DB. */
+export type ProviderForSnapshot = "go" | ProgrammaticProvider | ManualProvider;
 
 // ---------------------------------------------------------------------------
 // Live usage, read from OpenCode's own session database
@@ -373,9 +405,12 @@ export async function budgetSnapshot(opts: {
   ttlMs?: number;
   now?: number;
   dbPath?: string;
+  provider?: ProviderForSnapshot;
 }): Promise<BudgetSnapshot> {
   const now = opts.now ?? Date.now();
   const ttl = opts.ttlMs ?? 60_000;
+  const provider = opts.provider ?? "go";
+
   if (
     snapshotCache &&
     now - snapshotCache.at < ttl &&
@@ -385,36 +420,104 @@ export async function budgetSnapshot(opts: {
   }
 
   const byRef: Record<string, BudgetInfo> = {};
-  if (PLAN_LIMITS[opts.plan]) {
-    const [month, week, fiveHours] = await Promise.all([
-      readUsageByModel("month", opts.dbPath, now),
-      readUsageByModel("week", opts.dbPath, now),
-      readUsageByModel("5h", opts.dbPath, now),
-    ]);
-    for (const bare of Object.keys(PLAN_LIMITS[opts.plan])) {
-      const limitUsd = PLAN_LIMITS[opts.plan][bare];
-      const price = MODEL_PRICES[bare];
-      if (!price) continue;
-      const usedUsd = costOf(price, month[bare] ?? emptyBucket());
-      const usedWeek = costOf(price, week[bare] ?? emptyBucket());
-      const used5h = costOf(price, fiveHours[bare] ?? emptyBucket());
-      const remainingUsd = Math.max(0, limitUsd - usedUsd);
-      const cap5h = windowCap(limitUsd, "5h");
-      const capWeek = windowCap(limitUsd, "week");
-      byRef[`${GO_PROVIDER}/${bare}`] = {
-        ref: `${GO_PROVIDER}/${bare}`,
-        limitUsd,
-        usedUsd,
-        used5h,
-        cap5h,
-        usedWeek,
-        capWeek,
-        remainingUsd,
-        remainingPct: limitUsd > 0 ? remainingUsd / limitUsd : 1,
-        exhausted:
-          remainingUsd <= 0 || used5h >= cap5h || usedWeek >= capWeek,
-      };
+
+  // -------------------------------------------------------------------
+  // Read live usage from the selected provider
+  // -------------------------------------------------------------------
+  if (provider === "go") {
+    // Existing: read from session_v2 SQLite DB.
+    if (PLAN_LIMITS[opts.plan]) {
+      const dbPath = opts.dbPath ?? sessionDbPath();
+      const [month, week, fiveHours] = await Promise.all([
+        readUsageByModel("month", dbPath, now),
+        readUsageByModel("week", dbPath, now),
+        readUsageByModel("5h", dbPath, now),
+      ]);
+      for (const bare of Object.keys(PLAN_LIMITS[opts.plan])) {
+        const limitUsd = PLAN_LIMITS[opts.plan][bare];
+        const price = MODEL_PRICES[bare];
+        if (!price) continue;
+        const usedUsd = costOf(price, month[bare] ?? emptyBucket());
+        const usedWeek = costOf(price, week[bare] ?? emptyBucket());
+        const used5h = costOf(price, fiveHours[bare] ?? emptyBucket());
+        const remainingUsd = Math.max(0, limitUsd - usedUsd);
+        const cap5h = windowCap(limitUsd, "5h");
+        const capWeek = windowCap(limitUsd, "week");
+        byRef[`${GO_PROVIDER}/${bare}`] = {
+          ref: `${GO_PROVIDER}/${bare}`,
+          limitUsd,
+          usedUsd,
+          used5h,
+          cap5h,
+          usedWeek,
+          capWeek,
+          remainingUsd,
+          remainingPct: limitUsd > 0 ? remainingUsd / limitUsd : 1,
+          exhausted:
+            remainingUsd <= 0 || used5h >= cap5h || usedWeek >= capWeek,
+        };
+      }
     }
+  } else {
+    // Programmable provider: consult the adapter's readUsage().
+    const adapter = findAdapter(provider);
+    if (adapter && adapter.id !== "zen" && adapter.id !== "nim") {
+      try {
+        const liveUsage = await adapter.readUsage();
+        if (liveUsage && Object.keys(liveUsage).length > 0) {
+          // If the plan has registered limit tables, map the provider's
+          // usage into BudgetInfo entries keyed by the provider id.
+          if (PLAN_LIMITS[opts.plan]) {
+            for (const bare of Object.keys(PLAN_LIMITS[opts.plan])) {
+              const limitUsd = PLAN_LIMITS[opts.plan][bare];
+              const price = MODEL_PRICES[bare];
+              if (!price) continue;
+              const live = liveUsage[bare];
+              const usedUsd = live ? costOf(price, live) : 0;
+              const remainingUsd = Math.max(0, limitUsd - usedUsd);
+              byRef[`${provider}/${bare}`] = {
+                ref: `${provider}/${bare}`,
+                limitUsd,
+                usedUsd,
+                used5h: 0,
+                cap5h: windowCap(limitUsd, "5h"),
+                usedWeek: 0,
+                capWeek: windowCap(limitUsd, "week"),
+                remainingUsd,
+                remainingPct: limitUsd > 0 ? remainingUsd / limitUsd : 1,
+                exhausted: remainingUsd <= 0,
+              };
+            }
+          } else {
+            // No plan table for this provider — return a single entry
+            // for the first priced model we know, so the picker has
+            // something to look at but never constrains.
+            const firstBare = Object.keys(MODEL_PRICES)[0];
+            if (firstBare && MODEL_PRICES[firstBare]) {
+              const price = MODEL_PRICES[firstBare];
+              const live = liveUsage[firstBare];
+              const usedUsd = live ? costOf(price, live) : 0;
+              const remainingUsd = usedUsd > 0 ? 0 : 1; // placeholder
+              byRef[`${provider}/${firstBare}`] = {
+                ref: `${provider}/${firstBare}`,
+                limitUsd: 0,
+                usedUsd,
+                used5h: 0,
+                cap5h: 0,
+                usedWeek: 0,
+                capWeek: 0,
+                remainingUsd,
+                remainingPct: 1,
+                exhausted: false,
+              };
+            }
+          }
+        }
+      } catch {
+        // fail-soft: never throw; empty byRef → no constraint
+      }
+    }
+    // Manual providers (zen, nim): no endpoint → byRef stays empty.
   }
 
   const snapshot: BudgetSnapshot = { asOf: now, plan: opts.plan, byRef };
@@ -436,11 +539,16 @@ export function budgetFor(
   ref: string,
 ): BudgetInfo | undefined {
   if (!snapshot || !ref) return undefined;
-  // A ref naming another provider (nvidia/..., opencode/...) is not drawing
-  // on the Go subscription, so it has no bucket to report.
   const provider = providerOf(ref);
+  // Manual providers (zen, nim) have no budget data — never constrain.
+  if (provider && (provider === "zen" || provider === "nim")) return undefined;
+  // Only Go-qualified models can have Go budget data.
   if (provider && provider !== GO_PROVIDER) return undefined;
-  return snapshot.byRef[getBudgetRef(bareModel(ref))];
+  // Determine the key prefix used in the snapshot's byRef for this provider.
+  const bare = bareModel(ref);
+  if (!bare) return undefined;
+  const key = `${provider ?? GO_PROVIDER}/${bare}`;
+  return snapshot.byRef[key];
 }
 
 function getBudgetRef(bare: string): string {

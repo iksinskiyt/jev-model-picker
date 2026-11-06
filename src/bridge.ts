@@ -34,6 +34,11 @@ export type BridgeDecision = {
   defaultPrice: number;
   /** Accumulated savings estimate (USD), filled by the TUI. */
   saved?: number;
+  /**
+   * Pre-rendered substitution tell ("which model replaced which, and why"),
+   * stored so the TUI and `/jev-sub` show the same wording the transcript got.
+   */
+  tell?: string;
 };
 
 export type BridgeState = {

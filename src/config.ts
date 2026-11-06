@@ -5,6 +5,7 @@ import type {
   PlanId,
   SystemOneBackendConfig,
 } from "./types";
+import type { ProgrammaticProvider } from "./providers";
 import { PLAN_IDS } from "./limits";
 
 const DEFAULT_SYSTEMONE_BASE = "https://opencode.ai/inference/systemone/v1";
@@ -106,6 +107,30 @@ export function resolveConfig(options: unknown): PickerConfig {
     if (typeof text === "string" && text) descriptions[ref] = text;
   }
 
+  // Determine the budget provider. `auto` reads from whatever is actually
+  // readable; a named provider pins the source so the user can force a
+  // specific account's quota. Anything unrecognised falls back to "auto"
+  // rather than silently pinning Go, because a wrong pin would make every
+  // model on the *other* provider look unbudgeted.
+  const budgetProvider = str(budgetO.provider);
+  const PROGRAMMATIC: ReadonlySet<string> = new Set([
+    "opencode-go",
+    "openrouter",
+    "anthropic",
+    "openai",
+    "github-copilot",
+    "together",
+    "fireworks",
+  ]);
+  let resolvedProvider: "auto" | ProgrammaticProvider;
+  if (!budgetProvider || budgetProvider === "auto") {
+    resolvedProvider = "auto";
+  } else if (PROGRAMMATIC.has(budgetProvider)) {
+    resolvedProvider = budgetProvider as ProgrammaticProvider;
+  } else {
+    resolvedProvider = "auto";
+  }
+
   return {
     enabled: bool(o.enabled, true),
     backends,
@@ -132,6 +157,8 @@ export function resolveConfig(options: unknown): PickerConfig {
       windowAware: bool(budgetO.windowAware, true),
       capacityAware: bool(budgetO.capacityAware, true),
       minTasks: Math.max(1, num(budgetO.minTasks, 1)),
+      provider: resolvedProvider,
+      openrouterKey: str(budgetO.openrouterKey),
     },
   };
 }

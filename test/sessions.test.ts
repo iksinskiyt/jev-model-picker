@@ -3,6 +3,11 @@ import type { PickerRuntime } from "../src/pick";
 import type { BridgeDecision } from "../src/bridge";
 import { registerSessionInterceptor } from "../src/sessions";
 import { resetPendingPicks } from "../src/hook";
+import { readBridge } from "../src/bridge";
+
+// Tests must never write to the user's live bridge state. bridgeDirectory()
+// honours this env var, so point every test run at a throwaway directory.
+process.env.JEV_MODEL_PICKER_STATE = process.env.JEV_TEST_STATE ?? ".jev-test-state";
 
 /** Let the async event drain loop consume every queued event. */
 const drain = () => new Promise((r) => setTimeout(r, 20));
@@ -378,31 +383,75 @@ describe("session-layer interception", () => {
     expect(switches).toEqual([]);
   });
 
-  test("model variant is ignored when building the ref for comparison", async () => {
-    // A child on the pin with a variant set is still "on the pin" — the
-    // comparison must strip the variant or Jev would re-pick every time.
-    const { ctx, switches } = fakeHost([
+  test("records a readable substitution tell for the session layer", async () => {
+    const { ctx } = fakeHost([
       {
         type: "session.created",
         data: {
-          sessionID: "ses_child_variant",
+          sessionID: "ses_tell_check",
           parentID: "ses_root",
-          agent: "designer",
-          model: { providerID: "opencode-go", id: "qwen3.8-flash", variant: "xhigh" },
-          title: "Polish the sidebar spacing and hierarchy",
+          agent: "fixer",
+          model: { providerID: "opencode-go", id: "claude-haiku-5-5" },
+          title: "Polish copy in the admin panel components",
         },
       },
     ]);
     await registerSessionInterceptor(
       ctx,
       runtimeWith({
-        lanes: ["designer"],
-        pins: { designer: "opencode-go/qwen3.8-flash" },
-        pick: async () => ({ ref: "opencode-go/kimi-k3.1-pro", backend: "b" }),
+        lanes: ["fixer"],
+        pins: { fixer: "opencode-go/claude-haiku-5-5" },
+        pick: async () => ({
+          ref: "opencode-go/deepseek-v4.1-flash",
+          probability: 0.8,
+          reason: "deep bucket, cheap per task",
+          backend: "session-layer",
+        }),
       }),
     );
     await drain();
 
-    expect(switches[0].model.id).toBe("kimi-k3.1-pro");
+    // The session layer is the one path with no transcript to append a footer
+    // to, so its tell must live in the bridge record.
+    const decisions = readBridge().decisions;
+    const mine = decisions.find((d) => d.sessionID === "ses_tell_check");
+    expect(mine).toBeDefined();
+    expect(mine!.tell).toContain("SUBSTITUTED");
+    expect(mine!.tell).toContain("opencode-go/claude-haiku-5-5");
+    expect(mine!.tell).toContain("opencode-go/deepseek-v4.1-flash");
+    expect(mine!.tell).toContain("deep bucket, cheap per task");
+    // The tell is one line — a broken multi-line tell would wreck the sidebar.
+    expect(mine!.tell!.split("\n").length).toBe(1);
+  });
+
+  test("records a distinct PIN KEPT tell when Jev declines", async () => {
+    const { ctx } = fakeHost([
+      {
+        type: "session.created",
+        data: {
+          sessionID: "ses_tell_kept",
+          parentID: "ses_root",
+          agent: "oracle",
+          model: { providerID: "opencode-go", id: "qwen3.8-max" },
+          title: "Review the auth flow end to end",
+        },
+      },
+    ]);
+    await registerSessionInterceptor(
+      ctx,
+      runtimeWith({
+        lanes: ["oracle"],
+        pins: { oracle: "opencode-go/qwen3.8-max" },
+        pick: async () => undefined,
+      }),
+    );
+    await drain();
+
+    const decisions = readBridge().decisions;
+    const mine = decisions.find((d) => d.sessionID === "ses_tell_kept");
+    expect(mine).toBeDefined();
+    // A decline must not look like a substitution.
+    expect(mine!.tell).toContain("PIN KEPT");
+    expect(mine!.tell).not.toContain("SUBSTITUTED");
   });
 });

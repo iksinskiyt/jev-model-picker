@@ -1,4 +1,5 @@
 import type { PickerRuntime } from "./pick";
+import { formatSubstitution, substitutionFromDecision } from "./tell";
 
 const PICK_INPUT_SCHEMA = {
   type: "object",
@@ -57,6 +58,14 @@ export function formatPick(pick: {
 /**
  * Footer appended to a delegated tool's result so the probability bar shows
  * up in the session transcript right where the delegation happened.
+ *
+ * When a substitution happened (the picked model differs from the lane's
+ * default model), the output leads with an explicit substitution tell from
+ * src/tell.cs answering: which model was replaced, which replaced it, and why.
+ * The probability bar and budget tail follow.
+ *
+ * When no substitution happened (pin kept), the existing format is preserved
+ * so callers that don't care about substitution continue to work unchanged.
  */
 export function formatPickFooter(
   pick: {
@@ -75,6 +84,47 @@ export function formatPickFooter(
   },
 ): string {
   const probability = pick.probability ?? 0;
+  const hasSubstitution =
+    extra?.defaultModel !== undefined && pick.ref !== extra.defaultModel;
+
+  if (hasSubstitution) {
+    const sub = substitutionFromDecision(
+      {
+        ts: Date.now(),
+        sessionID: "",
+        task: "(delegated task)",
+        model: pick.ref,
+        defaultModel: extra.defaultModel,
+        probability,
+        margin: pick.margin ?? 0,
+        reason: pick.reason ?? "",
+        backend: pick.backend ?? "",
+        lane: extra.lane ?? "",
+        pickedPrice: 0,
+        defaultPrice: 0,
+      },
+      // The tell reads lane and pin off the decision itself.
+    );
+    // Lead with the substitution tell
+    const subLine = formatSubstitution(sub);
+    // Probability bar (visual) after the substitution line
+    const barLine =
+      `${probabilityBar(probability, 24)} ${(probability * 100).toFixed(1)}%` +
+      (pick.margin !== undefined ? ` (margin ${pick.margin.toFixed(2)})` : "");
+    // Budget tail
+    const budgetPieces: string[] = [];
+    if (pick.backend) budgetPieces.push(pick.backend);
+    if (pick.latencyMs) budgetPieces.push(`${pick.latencyMs}ms`);
+    if (extra?.budget) {
+      const b = extra.budget;
+      budgetPieces.push(
+        b.exhausted ? "plan budget exhausted" : `$${b.remainingUsd.toFixed(2)}/$${b.limitUsd} left this month`,
+      );
+    }
+    return [subLine, barLine, ...budgetPieces].join("\n");
+  }
+
+  // No substitution — preserve existing format
   const details: string[] = [];
   if (pick.reason) details.push(pick.reason);
   if (extra?.lane) details.push(`lane ${extra.lane}`);

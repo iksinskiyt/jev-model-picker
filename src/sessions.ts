@@ -1,5 +1,6 @@
 import type { PickerRuntime } from "./pick";
 import { recordDecisionToBridge } from "./bridge";
+import { formatSubstitution } from "./tell";
 
 /**
  * Session-layer interception.
@@ -63,6 +64,23 @@ export async function registerSessionInterceptor(
     pick?: any;
   }): void {
     try {
+      // Render the tell here so the session-layer path is visible in exactly
+      // the same wording the tool-hook footer and the TUI use. Without this the
+      // session layer is the one path that records silently.
+      const tell = formatSubstitution({
+        lane: entry.lane,
+        from: entry.pin ?? "(none)",
+        to: entry.model,
+        reason:
+          entry.pick?.reason ??
+          (entry.source === "preset"
+            ? "JEV declined — lane pin kept"
+            : "session-layer pick"),
+        probability: entry.pick?.probability,
+        source: entry.source === "preset" ? "preset-kept" : "session-layer",
+        sessionID: entry.sessionID,
+        ts: Date.now(),
+      });
       recordDecisionToBridge({
         ts: Date.now(),
         sessionID: entry.sessionID,
@@ -80,7 +98,11 @@ export async function registerSessionInterceptor(
         task: entry.pick?.reason ?? `(session) ${entry.lane}`,
         pickedPrice: 0,
         defaultPrice: 0,
+        tell,
       });
+      // Also surface it on the host log, because the session layer has no
+      // transcript of its own to append a footer to.
+      console.log(`[jev-model-picker] ${tell}`);
     } catch {
       // recording is best-effort
     }
