@@ -18,11 +18,21 @@ import {
   isCappedModel,
 } from "./limits";
 
-/** Known-bad / dark endpoints — updated from live probes (FINDINGS.md). */
+/**
+ * Known-bad / dark endpoints — updated from live probes (FINDINGS.md).
+ *
+ * Keyed by the bare NIM id, which is what getHealthModelId() returns after
+ * stripping the doubled "nvidia/nvidia/" prefix.
+ *
+ * Note the trap: `nemotron-3-super-120b-a12b` does NOT serve to this account,
+ * while `nemotron-3.5-super-vl-120b-a12b` (the observer pin) does. They differ
+ * by one "." and by "-vl-", and are easy to confuse when reading a pick.
+ */
 export const KNOWN_BAD_MODELS = new Set<string>([
   "z-ai/glm-5.3-flash", // timeout @ 100s, 240s ×3 — DOWN
   "deepseek-ai/deepseek-v4.1-flash", // timeout @ 240s ×2 — DOWN
   "z-ai/glm-5.3", // HTTP 410 EOL
+  "nemotron-3-super-120b-a12b", // HTTP error — not served to this account
 ]);
 
 /**

@@ -77,6 +77,16 @@ export function buildQuestions(
  * The picker runtime: catalog + policy + backends + cache + decision log.
  * `pick()` never throws; undefined means "keep the lane's pinned model".
  */
+/**
+ * Minimum confidence before Jev will override a healthy lane pin.
+ *
+ * Chosen from live measurement, not taste: probing this picker's own decision
+ * backend returned 14%–44% with wide run-to-run variance, and the pins it
+ * "improved on" were healthier than its choices. A substitution is only worth
+ * its risk above roughly a third. Override with `policy.minProbability`.
+ */
+const MIN_SUBSTITUTION_CONFIDENCE = 0.34;
+
 export class PickerRuntime {
   readonly cfg: PickerConfig;
   private readonly ctx: any;
@@ -250,6 +260,7 @@ export class PickerRuntime {
     const linked = settings.backend as
       | { baseURL?: string; apiKey?: string; model?: string }
       | undefined;
+    const pin = this.lanePin(lane);
     const budgetPolicy = resolveBudgetPolicy(
       cfg.budget ?? DEFAULT_BUDGET_POLICY,
       settings.budget,
@@ -364,6 +375,31 @@ export class PickerRuntime {
       }
     } catch (e) {
       errors.push(`picker: ${(e as Error)?.message ?? String(e)}`);
+    }
+
+    // --- Confidence floor -------------------------------------------------
+    // A low-confidence pick is not evidence, it is noise, and the cost of a
+    // noisy substitution is a whole delegated task running on the wrong model.
+    // The lane's pin was chosen deliberately (often benchmarked by hand), so
+    // Jev only overrides it when it actually has an opinion. Below the floor it
+    // declines and the pin stands — the same never-block rule used everywhere
+    // else. An *unhealthy* pin is still overridden, because keeping it is worse
+    // than a mediocre pick.
+    if (pick && pin && pin !== pick.ref) {
+      const confidence = pick.probability ?? 0;
+      // An explicit policy.minProbability wins; otherwise the evidence-based
+      // default below. Live probes of this picker returned 14–44% confidence
+      // with wide run-to-run variance, so anything under a third is noise.
+      const minConfidence =
+        cfg.policy.minProbability > 0
+          ? cfg.policy.minProbability
+          : MIN_SUBSTITUTION_CONFIDENCE;
+      const pinIsHealthy = offered.some(
+        (c) => c.ref === pin && !c.budget?.exhausted,
+      );
+      if (confidence < minConfidence && pinIsHealthy) {
+        pick = undefined;
+      }
     }
 
     this.cache.set(cacheKey, { t: Date.now(), pick });
