@@ -17,12 +17,15 @@ import { logDecision } from "./log";
 import { resolveProviderKey } from "./creds";
 import { readBridge } from "./bridge";
 import {
+  averageDemand,
   budgetFor,
   budgetNote,
   budgetSnapshot,
   DEFAULT_BUDGET_POLICY,
-  partitionByBudget,
+  partitionByTaskFit,
+  readDemandByAgent,
   resolveBudgetPolicy,
+  type DemandProfile,
 } from "./limits";
 
 export function buildQuestions(
@@ -44,10 +47,14 @@ export function buildQuestions(
   let budgetGuidance = "";
   if (hasNotes) {
     budgetGuidance +=
-      " Each candidate shows its remaining plan budget in parentheses where known — treat a nearly-exhausted model as unavailable unless nothing else fits.";
+      " Each candidate shows its remaining plan budget and how many more tasks like this it can absorb — treat a nearly-exhausted model, or one that cannot absorb another task, as unavailable unless nothing else fits.";
   }
   if (withheld && withheld.length > 0) {
-    budgetGuidance += ` These models were withheld because their plan budget is nearly exhausted: ${withheld.join(", ")}.`;
+    budgetGuidance += ` These models were withheld because their plan budget is nearly exhausted or cannot absorb a task this size: ${withheld.join(", ")}.`;
+  }
+  if (hasNotes) {
+    budgetGuidance +=
+      " Spend the expensive, low-capacity models only on work that clearly needs them; cheap models with deep remaining capacity handle everything else.";
   }
 
   return {
@@ -265,10 +272,11 @@ export class PickerRuntime {
       );
 
       // Live plan budgets: annotate every candidate, then withhold the ones
-      // whose allowance cannot absorb another task. When nothing has room we
-      // offer everything and let the picker choose (a starved pick still beats
-      // falling back to a model that is also exhausted).
+      // whose allowance cannot absorb another task of this size. When nothing
+      // has room we offer everything and let the picker choose (a starved pick
+      // still beats falling back to a model that is also exhausted).
       let snapshot: BudgetSnapshot | undefined;
+      let tasksLeft: Map<string, number> | undefined;
       if (budgetPolicy.enabled) {
         try {
           snapshot = await budgetSnapshot({ plan: budgetPolicy.plan });
@@ -278,11 +286,25 @@ export class PickerRuntime {
         for (const c of candidates) c.budget = budgetFor(snapshot, c.ref);
       }
 
-      const { preferred, tight } = partitionByBudget(
+      // Observed per-lane demand: how big a task like this usually is, so
+      // "remaining budget" can be expressed in tasks the model can still run.
+      let profile: DemandProfile | undefined;
+      if (budgetPolicy.enabled && budgetPolicy.capacityAware) {
+        try {
+          const demand = await readDemandByAgent();
+          profile = demand[lane ?? ""] ?? averageDemand(Object.values(demand));
+        } catch {
+          profile = undefined;
+        }
+      }
+
+      const { preferred, tight, tasksLeft: left } = partitionByTaskFit(
         candidates,
         snapshot,
         budgetPolicy,
+        profile,
       );
+      tasksLeft = left;
       if (preferred.length >= 2) {
         offered = preferred;
         budgetSkipped = tight.map((c) => c.ref);
@@ -292,7 +314,9 @@ export class PickerRuntime {
 
       if (offered.length >= 2) {
         const notes: Record<string, string | undefined> = {};
-        for (const c of offered) notes[c.ref] = budgetNote(c.budget);
+        for (const c of offered) {
+          notes[c.ref] = budgetNote(c.budget, tasksLeft?.get(c.ref));
+        }
         const questions = buildQuestions(
           offered,
           lane,

@@ -47,6 +47,15 @@ export interface BudgetPolicy {
   floorPct: number;
   /** Also honour the 5h/weekly caps (20%/50% of the monthly allowance). */
   windowAware: boolean;
+  /**
+   * Measure remaining room in *tasks* instead of dollars: a model is only
+   * offered when its remaining allowance can absorb another task of the
+   * lane's observed size. This is what keeps a fast-draining premium model
+   * for the work that needs it.
+   */
+  capacityAware: boolean;
+  /** How many more such tasks a model must be able to absorb. */
+  minTasks: number;
 }
 
 /** Live budget picture for one capped model. */

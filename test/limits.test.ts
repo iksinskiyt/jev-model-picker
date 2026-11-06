@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  averageDemand,
   bareModel,
   budgetFor,
   budgetNote,
@@ -11,14 +12,19 @@ import {
   budgetTight,
   costOf,
   describeBudget,
+  estimateTaskCost,
   FIVE_HOURS_MS,
   monthStartUtc,
+  modelCapacity,
   MODEL_PRICES,
   partitionByBudget,
+  partitionByTaskFit,
   PLAN_LIMITS,
   PLAN_IDS,
   planEntry,
+  readDemandByAgent,
   readUsageByModel,
+  remainingCapacity,
   resetBudgetCache,
   resolveBudgetPolicy,
   windowCap,
@@ -26,7 +32,30 @@ import {
 import { buildQuestions } from "../src/pick";
 import { formatPickFooter } from "../src/tool";
 import { DEFAULT_BUDGET_POLICY } from "../src/limits";
-import type { BudgetSnapshot } from "../src/types";
+import type { BudgetSnapshot, DemandProfile } from "../src/types";
+
+/** Local BudgetInfo factory for the fixture snapshots below. */
+function info(
+  ref: string,
+  limitUsd: number,
+  usedUsd: number,
+  remainingUsd: number,
+  exhausted = false,
+) {
+  const remainingPct = limitUsd > 0 ? remainingUsd / limitUsd : 1;
+  return {
+    ref,
+    limitUsd,
+    usedUsd,
+    used5h: usedUsd,
+    cap5h: limitUsd * 0.2,
+    usedWeek: usedUsd,
+    capWeek: limitUsd * 0.5,
+    remainingUsd,
+    remainingPct,
+    exhausted,
+  };
+}
 
 /** Windows keeps the sqlite handle alive for a moment after close(). */
 function dropDb(path: string): void {
@@ -44,6 +73,8 @@ function makeDb(rows: Array<Record<string, unknown>>): string {
   db.prepare(
     `create table session_v2 (
        id text primary key,
+       parent_id text,
+       agent text,
        model text,
        tokens_input integer,
        tokens_output integer,
@@ -54,12 +85,14 @@ function makeDb(rows: Array<Record<string, unknown>>): string {
      )`,
   ).run();
   const stmt = db.prepare(
-    `insert into session_v2 (id, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, time_created, time_updated)
-     values (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `insert into session_v2 (id, parent_id, agent, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, time_created, time_updated)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const row of rows) {
     stmt.run(
       String(row.id ?? "ses_x"),
+      (row.parent_id as string) ?? null,
+      (row.agent as string) ?? null,
       String(row.model ?? "{}"),
       Number(row.tokens_input ?? 0),
       Number(row.tokens_output ?? 0),
@@ -200,8 +233,34 @@ describe("usage aggregation from the session database", () => {
     const usage = await readUsageByModel("month", join(tmpdir(), "definitely-not-here.db"));
     expect(usage).toEqual({});
     resetBudgetCache();
-    const snapshot = await budgetSnapshot({ plan: "go", ttlMs: 0, dbPath: join(tmpdir(), "nope.db") });
+    const snapshot = await budgetSnapshot({ plan: "go", ttlMs: 0, now: Date.UTC(2026, 10, 6, 12), dbPath: join(tmpdir(), "nope.db") });
     expect(Object.keys(snapshot.byRef).length).toBeGreaterThan(0);
+  });
+
+  test("reads per-agent demand, averaged over that agent's sessions", async () => {
+    const now = Date.UTC(2026, 10, 6, 12, 0, 0);
+    const path = makeDb([
+      { id: "f1", parent_id: "p", agent: "fixer", model: goModel("glm-5.2"), tokens_input: 100_000, tokens_output: 4_000, tokens_cache_read: 700_000, time_updated: now },
+      { id: "f2", parent_id: "p", agent: "fixer", model: goModel("glm-5.2"), tokens_input: 300_000, tokens_output: 12_000, tokens_cache_read: 1_100_000, time_updated: now },
+      { id: "o1", parent_id: "p", agent: "orchestrator", model: goModel("gemini-4-argon"), tokens_input: 10_000, tokens_output: 500, tokens_cache_read: 40_000, time_updated: now },
+    ]);
+    const demand = await readDemandByAgent(path);
+    dropDb(path);
+    expect(demand["fixer"]).toEqual({
+      tasks: 2,
+      input: 200_000,
+      output: 8_000,
+      cacheRead: 900_000,
+    });
+    expect(demand["orchestrator"].input).toBe(10_000);
+    // Real traffic is cache-read dominated, so cost per task tracks the cached
+    // price: GLM-5.2 caches at $0.26 vs Argon's $0.10 makes them near-equal
+    // here, while MiMo's $0.0028 is an order of magnitude cheaper.
+    const cheap = estimateTaskCost(demand["fixer"], MODEL_PRICES["glm-5.2"]!);
+    const dear = estimateTaskCost(demand["fixer"], MODEL_PRICES["gemini-4-argon"]!);
+    const flash = estimateTaskCost(demand["fixer"], MODEL_PRICES["mimo-v2.6-flash"]!);
+    expect(dear).toBeGreaterThan(flash * 15);
+    expect(Math.abs(dear - cheap) / dear).toBeLessThan(0.2);
   });
 });
 
@@ -341,7 +400,162 @@ describe("presentation", () => {
     }, ["opencode-go/glm-5.2"]);
     expect(q.model.criteria["opencode-go/deepseek-v4.1-flash"]).toContain("$95.00/$100 left");
     expect(q.model.instructions).toContain("remaining plan budget");
-    expect(q.model.instructions).toContain("nearly exhausted: opencode-go/glm-5.2");
+    expect(q.model.instructions).toContain("task this size: opencode-go/glm-5.2");
+  });
+});
+
+describe("effective capacity", () => {
+  test("a $60 bucket buys wildly different token counts by model", () => {
+    const muse = modelCapacity({
+      limitUsd: 60,
+      price: MODEL_PRICES["muse-spark-1.3-contributor"]!,
+    });
+    const glm = modelCapacity({
+      limitUsd: 60,
+      price: MODEL_PRICES["glm-5.2"]!,
+    });
+    // $60 / $0.10 per MTok = 600M input tokens; $60 / $1.40 = ~42.9M
+    expect(muse.inputTokens).toBeCloseTo(600e6, -3);
+    expect(glm.inputTokens).toBeCloseTo(42.86e6, -4);
+    expect(muse.inputTokens / glm.inputTokens).toBeGreaterThan(10);
+  });
+
+  test("remaining capacity scales with remaining share", () => {
+    const info = {
+      ref: "opencode-go/glm-5.2",
+      limitUsd: 60,
+      usedUsd: 30,
+      used5h: 30,
+      cap5h: 12,
+      usedWeek: 30,
+      capWeek: 30,
+      remainingUsd: 30,
+      remainingPct: 0.5,
+      exhausted: false,
+    };
+    const cap = remainingCapacity(info);
+    expect(cap.inputTokens).toBeCloseTo(21.43e6, -4);
+  });
+
+  test("premium models drain fastest (the sheet's real ranking)", () => {
+    // Argon: $30 cap at the current 50%-off price of $2/MTok in → 15M tokens.
+    // The discount ends 2026-11-30, after which this halves to 7.5M.
+    const argon = modelCapacity({ limitUsd: 30, price: MODEL_PRICES["gemini-4-argon"]! });
+    const deepseek = modelCapacity({ limitUsd: 100, price: MODEL_PRICES["deepseek-v4.1-flash"]! });
+    expect(argon.inputTokens).toBeCloseTo(15e6, -5);
+    expect(argon.outputTokens).toBeCloseTo(3e6, -5);
+    expect(deepseek.inputTokens / argon.inputTokens).toBeGreaterThan(4);
+  });
+});
+
+describe("task demand and task-fit partitioning", () => {
+  // A fixer-shaped task from the real DB: ~200K fresh input, ~1.5M cached
+  // re-reads, ~10K output. Cached reads dominate, which is why cost per task
+  // tracks the cached-read price, not the headline input price.
+  const fixerProfile: DemandProfile = { tasks: 10, input: 200_000, output: 10_000, cacheRead: 1_500_000 };
+  const librarianProfile: DemandProfile = { tasks: 40, input: 20_000, output: 2_000, cacheRead: 90_000 };
+
+  test("averages demand across agents when the lane has no history", () => {
+    const avg = averageDemand([fixerProfile, librarianProfile])!;
+    expect(avg.input).toBeCloseTo((200_000 * 10 + 20_000 * 40) / 50, 3);
+    expect(avg.tasks).toBe(50);
+    expect(averageDemand([])).toBeUndefined();
+  });
+
+  test("cached-read price dominates the real cost of a task", () => {
+    const argon = estimateTaskCost(fixerProfile, MODEL_PRICES["gemini-4-argon"]!);
+    const mimo = estimateTaskCost(fixerProfile, MODEL_PRICES["mimo-v2.6-flash"]!);
+    // MiMo caches at $0.0028/MTok vs Argon's $0.10 — ~30x cheaper per task
+    // even though the headline input prices differ by ~14x.
+    expect(argon / mimo).toBeGreaterThan(15);
+    expect(argon).toBeCloseTo(0.4 + 0.1 + 0.15, 6);
+  });
+
+  test("withholding is by task fit: premium models drop out for big tasks", () => {
+    // All three sit inside their month/week/5h windows, so the only thing that
+    // can push a model out here is the *size* of the task.
+    const snapshot: BudgetSnapshot = {
+      asOf: 0,
+      plan: "go",
+      byRef: {
+        "opencode-go/gemini-4-argon": {
+          ref: "opencode-go/gemini-4-argon",
+          limitUsd: 30,
+          usedUsd: 15,
+          used5h: 1,
+          cap5h: 6,
+          usedWeek: 2,
+          capWeek: 15,
+          remainingUsd: 15,
+          remainingPct: 0.5,
+          exhausted: false,
+        },
+        "opencode-go/claude-haiku-5-5": {
+          ref: "opencode-go/claude-haiku-5-5",
+          limitUsd: 15,
+          usedUsd: 1,
+          used5h: 0.2,
+          cap5h: 3,
+          usedWeek: 0.5,
+          capWeek: 7.5,
+          remainingUsd: 14,
+          remainingPct: 14 / 15,
+          exhausted: false,
+        },
+        "opencode-go/deepseek-v4.1-flash": {
+          ref: "opencode-go/deepseek-v4.1-flash",
+          limitUsd: 100,
+          usedUsd: 10,
+          used5h: 1,
+          cap5h: 20,
+          usedWeek: 2,
+          capWeek: 50,
+          remainingUsd: 90,
+          remainingPct: 0.9,
+          exhausted: false,
+        },
+      },
+    };
+    const policy = { ...DEFAULT_BUDGET_POLICY, minTasks: 1 };
+    const items = [
+      { ref: "opencode-go/gemini-4-argon" },
+      { ref: "opencode-go/claude-haiku-5-5" },
+      { ref: "opencode-go/deepseek-v4.1-flash" },
+    ];
+    const { preferred: fix, tasksLeft } = partitionByTaskFit(items, snapshot, policy, fixerProfile);
+    // deepseek absorbs thousands of fixer tasks; argon tens; claude hundreds
+    expect(tasksLeft.get("opencode-go/deepseek-v4.1-flash")!).toBeGreaterThan(1000);
+    expect(tasksLeft.get("opencode-go/gemini-4-argon")!).toBeGreaterThan(10);
+    expect(fix.length).toBe(3);
+
+    const { preferred: lib } = partitionByTaskFit(items, snapshot, policy, librarianProfile);
+    expect(lib.length).toBe(3);
+
+    // A much larger task (long-horizon work) pushes the premium bucket out
+    const huge: DemandProfile = { tasks: 5, input: 10_000_000, output: 200_000, cacheRead: 40_000_000 };
+    const { preferred: big, tight } = partitionByTaskFit(items, snapshot, policy, huge);
+    expect(tight.map((i) => i.ref)).toContain("opencode-go/gemini-4-argon");
+    expect(big.map((i) => i.ref)).toContain("opencode-go/deepseek-v4.1-flash");
+    expect(big.map((i) => i.ref)).not.toContain("opencode-go/gemini-4-argon");
+  });
+
+  test("notes report tasks left", () => {
+    const info = {
+      ref: "opencode-go/glm-5.2",
+      limitUsd: 60,
+      usedUsd: 41,
+      used5h: 1,
+      cap5h: 12,
+      usedWeek: 1,
+      capWeek: 30,
+      remainingUsd: 19,
+      remainingPct: 19 / 60,
+      exhausted: false,
+    };
+    const note = budgetNote(info, 3);
+    expect(note).toContain("$19.00/$60 left this month");
+    expect(note).toContain("~3 tasks left");
+    expect(budgetNote(info, 0)).toContain("cannot absorb another task");
   });
 });
 
@@ -354,6 +568,8 @@ describe("policy resolution", () => {
       floorUsd: 2,
       floorPct: base.floorPct,
       windowAware: true,
+      capacityAware: true,
+      minTasks: 1,
     });
     const partial = resolveBudgetPolicy(base, { plan: "nope", floorUsd: -3, windowAware: false });
     expect(partial.plan).toBe("go");

@@ -420,6 +420,8 @@ export default Plugin.define({
               floorUsd: floor?.trim() ? Number(floor) : current?.floorUsd,
               floorPct: current?.floorPct,
               windowAware: current?.windowAware,
+              capacityAware: current?.capacityAware,
+              minTasks: current?.minTasks,
               enabled: current?.enabled,
             },
           }

@@ -130,6 +130,8 @@ export function resolveConfig(options: unknown): PickerConfig {
       floorUsd: num(budgetO.floorUsd, 0.5),
       floorPct: num(budgetO.floorPct, 3),
       windowAware: bool(budgetO.windowAware, true),
+      capacityAware: bool(budgetO.capacityAware, true),
+      minTasks: Math.max(1, num(budgetO.minTasks, 1)),
     },
   };
 }

@@ -458,6 +458,149 @@ export function describeBudget(info: BudgetInfo | undefined): string | undefined
 }
 
 // ---------------------------------------------------------------------------
+// Effective capacity and task demand
+// ---------------------------------------------------------------------------
+
+/**
+ * What a monthly allowance actually buys, in tokens.
+ *
+ * A $60 bucket is not "60 units of model": at $0.10/MTok in it is 600M input
+ * tokens, at $4/MTok it is 7.5M. The plan therefore runs out orders of
+ * magnitude faster on a premium model, and "remaining dollars" is a poor
+ * proxy for "can this model absorb the task". These numbers come from the
+ * same plan tables (limit ÷ price).
+ */
+export interface ModelCapacity {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+}
+
+export function modelCapacity(entry: {
+  limitUsd: number;
+  price: ModelPrice;
+}): ModelCapacity {
+  const { limitUsd, price } = entry;
+  return {
+    inputTokens: limitUsd / Math.max(price.input, 1e-9) * 1e6,
+    outputTokens: limitUsd / Math.max(price.output, 1e-9) * 1e6,
+    cachedReadTokens:
+      price.cacheRead > 0 ? (limitUsd / price.cacheRead) * 1e6 : Infinity,
+  };
+}
+
+/** How much of that capacity is still available this period. */
+export function remainingCapacity(info: BudgetInfo): ModelCapacity {
+  const price = MODEL_PRICES[bareModel(info.ref)];
+  if (!price) return { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0 };
+  const full = modelCapacity({ limitUsd: info.limitUsd, price });
+  const share = Math.max(0, info.remainingPct);
+  return {
+    inputTokens: full.inputTokens * share,
+    outputTokens: full.outputTokens * share,
+    cachedReadTokens: full.cachedReadTokens * share,
+  };
+}
+
+/** Observed per-agent demand, averaged over that agent's completed work. */
+export interface DemandProfile {
+  tasks: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+}
+
+/**
+ * Average token demand per agent, so a pick can ask "can this model absorb
+ * a task like this?" with the user's real numbers instead of a guess.
+ * Subagent sessions are the lanes, so grouping by `agent` yields exactly the
+ * per-lane demand profile.
+ */
+export async function readDemandByAgent(
+  dbPath: string = sessionDbPath(),
+): Promise<Record<string, DemandProfile>> {
+  if (!dbPath || !existsSync(dbPath)) return {};
+  const db = await openDatabase(dbPath);
+  if (!db) return {};
+  try {
+    const rows = db
+      .prepare(
+        `select agent,
+                sum(tokens_input) as input,
+                sum(tokens_output) as output,
+                sum(tokens_cache_read) as cache_read,
+                count(*) as tasks
+           from session_v2
+          where agent is not null
+          group by agent`,
+      )
+      .all() as any[];
+    const out: Record<string, DemandProfile> = {};
+    for (const row of rows ?? []) {
+      const agent = String(row?.agent ?? "");
+      if (!agent) continue;
+      out[agent] = {
+        tasks: toNum(row?.tasks),
+        input: toNum(row?.input) / Math.max(1, toNum(row?.tasks)),
+        output: toNum(row?.output) / Math.max(1, toNum(row?.tasks)),
+        cacheRead: toNum(row?.cache_read) / Math.max(1, toNum(row?.tasks)),
+      };
+    }
+    return out;
+  } catch {
+    return {};
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** USD a task of this profile would cost on a model. */
+export function estimateTaskCost(
+  profile: DemandProfile | undefined,
+  price: ModelPrice,
+): number {
+  if (!profile) return 0;
+  return costOf(price, {
+    input: profile.input,
+    output: profile.output,
+    cacheRead: profile.cacheRead,
+  });
+}
+
+/** Pooled profile across agents — the fallback when a lane has no history. */
+export function averageDemand(
+  profiles: readonly DemandProfile[],
+): DemandProfile | undefined {
+  if (profiles.length === 0) return undefined;
+  const total = profiles.reduce(
+    (acc, p) => ({
+      tasks: acc.tasks + Math.max(1, p.tasks),
+      input: acc.input + p.input * Math.max(1, p.tasks),
+      output: acc.output + p.output * Math.max(1, p.tasks),
+      cacheRead: acc.cacheRead + p.cacheRead * Math.max(1, p.tasks),
+    }),
+    { tasks: 0, input: 0, output: 0, cacheRead: 0 },
+  );
+  const n = Math.max(1, total.tasks);
+  return { tasks: total.tasks, input: total.input / n, output: total.output / n, cacheRead: total.cacheRead / n };
+}
+
+/** How many more tasks of this profile a remaining budget can absorb. */
+export function tasksRemaining(
+  remainingUsd: number,
+  profile: DemandProfile | undefined,
+  price: ModelPrice,
+): number {
+  const cost = estimateTaskCost(profile, price);
+  if (!(cost > 0)) return Number.POSITIVE_INFINITY;
+  return Math.floor(remainingUsd / cost);
+}
+
+// ---------------------------------------------------------------------------
 // Selection helpers
 // ---------------------------------------------------------------------------
 
@@ -467,6 +610,8 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicy = {
   floorUsd: 0.5,
   floorPct: 3,
   windowAware: true,
+  capacityAware: true,
+  minTasks: 1,
 };
 
 /** A model is "tight" when what's left cannot absorb another real task. */
@@ -503,15 +648,65 @@ export function partitionByBudget<T extends { ref: string }>(
   return { preferred, tight };
 }
 
+/**
+ * Same split, but measured against what the task will actually *cost* rather
+ * than a fixed dollar floor: a model is preferred only when its remaining
+ * allowance can absorb another task of this shape (`tasksLeft >= minTasks`).
+ *
+ * This is what makes allocation sane: a premium model with $3 left can still
+ * pay for one librarian task but not for a fixer-sized one, so the picker
+ * spends the premium bucket on the work that needs it and keeps the cheap,
+ * deep buckets for everything else.
+ */
+export function partitionByTaskFit<T extends { ref: string }>(
+  items: readonly T[],
+  snapshot: BudgetSnapshot | undefined,
+  policy: BudgetPolicy,
+  profile: DemandProfile | undefined,
+): { preferred: T[]; tight: T[]; tasksLeft: Map<string, number> } {
+  const tasksLeft = new Map<string, number>();
+  if (!policy.enabled || !snapshot) {
+    for (const item of items) tasksLeft.set(item.ref, Number.POSITIVE_INFINITY);
+    return { preferred: [...items], tight: [], tasksLeft };
+  }
+  const preferred: T[] = [];
+  const tight: T[] = [];
+  for (const item of items) {
+    const info = budgetFor(snapshot, item.ref);
+    if (budgetTight(info, policy)) {
+      tasksLeft.set(item.ref, 0);
+      tight.push(item);
+      continue;
+    }
+    const price = MODEL_PRICES[bareModel(item.ref)];
+    // Unknown price (free/uncapped, other provider) = no measurable drain.
+    const left =
+      info && price
+        ? tasksRemaining(info.remainingUsd, profile, price)
+        : Number.POSITIVE_INFINITY;
+    tasksLeft.set(item.ref, left);
+    if (policy.capacityAware && left < policy.minTasks) tight.push(item);
+    else preferred.push(item);
+  }
+  return { preferred, tight, tasksLeft };
+}
+
 /** Criteria text appended to a candidate's description. */
 export function budgetNote(
   info: BudgetInfo | undefined,
+  tasksLeft?: number,
 ): string | undefined {
   if (!info) return undefined;
   const label = describeBudget(info);
   if (!label) return undefined;
   const used = info.usedUsd.toFixed(2);
-  return `${label} ($${used} used of $${info.limitUsd}/mo)`;
+  const capacity =
+    tasksLeft === undefined || !Number.isFinite(tasksLeft)
+      ? ""
+      : tasksLeft >= 1
+        ? ` · ~${tasksLeft} task${tasksLeft === 1 ? "" : "s"} left`
+        : " · cannot absorb another task";
+  return `${label} ($${used} used of $${info.limitUsd}/mo)${capacity}`;
 }
 
 /** Merge plugin options with TUI bridge overrides, validating every field. */
@@ -533,6 +728,9 @@ export function resolveBudgetPolicy(
     floorPct: finiteOr(o.floorPct, base.floorPct),
     windowAware:
       typeof o.windowAware === "boolean" ? o.windowAware : base.windowAware,
+    capacityAware:
+      typeof o.capacityAware === "boolean" ? o.capacityAware : base.capacityAware,
+    minTasks: finiteOr(o.minTasks, base.minTasks) || base.minTasks,
   };
 }
 
