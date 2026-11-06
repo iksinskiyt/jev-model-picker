@@ -5,6 +5,13 @@ import { createSignal, For, Show, onCleanup, onMount } from "solid-js"
 import { TextAttributes } from "@opentui/core"
 import { counterfactualGain, readBridge, writeBridge } from "../bridge"
 import type { BridgeDecision, BridgeState } from "../bridge"
+import {
+  budgetSnapshot,
+  DEFAULT_BUDGET_POLICY,
+  describeBudget,
+  PLAN_IDS,
+  resolveBudgetPolicy,
+} from "../limits"
 
 /**
  * TUI surface for jev-model-picker.
@@ -378,6 +385,55 @@ export default Plugin.define({
         },
       },
       {
+        id: `${PLUGIN_ID}.plan`,
+        title: "JEV: subscription plan & budget floor",
+        description: "Go, Go Plus or Go Teams; skip models with below this much left",
+        group: "JEV",
+        palette: true as const,
+        slash: { name: "jev-plan" },
+        run: async () => {
+          const current = readBridge().settings?.budget as
+            | Record<string, unknown>
+            | undefined
+          const plan = await ui.dialog.prompt({
+            title: "Subscription plan",
+            description: "go · go-plus · go-teams — sets each model's monthly allowance",
+            placeholder: String(current?.plan ?? "go"),
+          })
+          if (plan === undefined) return
+          const floor = await ui.dialog.prompt({
+            title: "Floor (USD)",
+            description: "Skip models with less than this left — empty keeps the default",
+            placeholder: String(current?.floorUsd ?? "0.5"),
+          })
+          const planRaw = String(plan).trim()
+          const planValue: (typeof PLAN_IDS)[number] = (
+            PLAN_IDS as readonly string[]
+          ).includes(planRaw)
+            ? (planRaw as (typeof PLAN_IDS)[number])
+            : "go"
+          const settings: Record<string, unknown> = {
+            ...readBridge().settings,
+            budget: {
+              ...current,
+              plan: planValue,
+              floorUsd: floor?.trim() ? Number(floor) : current?.floorUsd,
+              floorPct: current?.floorPct,
+              windowAware: current?.windowAware,
+              enabled: current?.enabled,
+            },
+          }
+          commit((state) => {
+            state.settings = settings
+          })
+          ui.toast.show({
+            title: "JEV",
+            message: `budget: plan ${settings.budget ? (settings.budget as any).plan : "?"} · floor $${(settings.budget as any).floorUsd ?? "default"}`,
+            variant: "success",
+          })
+        },
+      },
+      {
         id: `${PLUGIN_ID}.panel`,
         title: "JEV: status panel",
         description: "Side panel: is JEV working, and the last delegated prompt",
@@ -395,6 +451,37 @@ export default Plugin.define({
     }))
 
     // -------------------------------------------------------------- sidebar
+    // Live plan budget: the tightest bucket among the models this session has
+    // picked, so the row can say "gemini-4-argon $0.02/$30 left" just before
+    // the picker runs dry. Reads the same bundled snapshot the server uses
+    // (~120ms on a 400MB DB), refreshed at savings cadence ×5 and cached
+    // between refreshes so the line never flickers away.
+    const [budgetLine, setBudgetLine] = createSignal<string | undefined>(undefined)
+    let budgetAt = 0
+    async function refreshBudgetLine(sessionID: string): Promise<void> {
+      try {
+        const decisions = decisionsFor(sessionID)
+        if (decisions.length === 0) {
+          setBudgetLine(undefined)
+          return
+        }
+        const policy = resolveBudgetPolicy(
+          DEFAULT_BUDGET_POLICY,
+          readBridge().settings?.budget,
+        )
+        if (!policy.enabled) return
+        const used = new Set(
+          decisions.map((d) => d.model).filter((m): m is string => !!m),
+        )
+        const snapshot = await budgetSnapshot({ plan: policy.plan })
+        const rows = Object.values(snapshot.byRef).filter((info) => used.has(info.ref))
+        if (rows.length === 0) return
+        const worst = rows.sort((a, b) => a.remainingPct - b.remainingPct)[0]
+        setBudgetLine(describeBudget(worst))
+      } catch {
+        // a budget read failure must never disturb the sidebar
+      }
+    }
 
     /**
      * One row, OpenCode sidebar style: glyph on the left, bold label, and the
@@ -414,6 +501,10 @@ export default Plugin.define({
         const picks = decisionsFor(sessionID)
         const last = picks[0]
         const prompt = last?.task ? oneLine(last.task) : ""
+        if (picks.length > 0 && Date.now() - budgetAt > SAVINGS_POLL_MS * 5) {
+          budgetAt = Date.now()
+          void refreshBudgetLine(sessionID)
+        }
         return (
           <box flexDirection="column">
             <box
@@ -442,6 +533,11 @@ export default Plugin.define({
                 {`saved $${saved.toFixed(4)}`}
               </text>
             </Show>
+            <Show when={budgetLine()}>
+              <text fg={muted} wrapMode="none" truncate flexShrink={0}>
+                {budgetLine()}
+              </text>
+            </Show>
           </box>
         )
       },
@@ -460,6 +556,10 @@ export default Plugin.define({
       const s = statusFor(sid)
       const picks = decisionsFor(sid)
       const last = picks[0]
+      if (picks.length > 0 && Date.now() - budgetAt > SAVINGS_POLL_MS * 5) {
+        budgetAt = Date.now()
+        void refreshBudgetLine(sid)
+      }
       keymap.layer(() => ({
         mode: "global",
         commands: [
@@ -496,6 +596,11 @@ export default Plugin.define({
           <text fg={accent} attributes={TextAttributes.BOLD}>
             {`saved $${savedFor(sid).toFixed(4)}`}
           </text>
+          <Show when={budgetLine()}>
+            <text fg={muted} wrapMode="none" truncate>
+              {budgetLine()}
+            </text>
+          </Show>
           <text fg={muted}>esc close · probability bars stay in the transcript</text>
         </box>
       )

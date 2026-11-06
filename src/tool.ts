@@ -67,7 +67,12 @@ export function formatPickFooter(
     backend: string;
     latencyMs?: number;
   },
-  extra?: { lane?: string; defaultModel?: string; ratio?: number },
+  extra?: {
+    lane?: string;
+    defaultModel?: string;
+    ratio?: number;
+    budget?: { remainingUsd: number; limitUsd: number; exhausted: boolean };
+  },
 ): string {
   const probability = pick.probability ?? 0;
   const details: string[] = [];
@@ -76,6 +81,14 @@ export function formatPickFooter(
   if (extra?.defaultModel) details.push(`default ${extra.defaultModel}`);
   if (extra?.ratio !== undefined && Number.isFinite(extra.ratio)) {
     details.push(`${(extra.ratio * 100).toFixed(0)}% of default price`);
+  }
+  if (extra?.budget) {
+    const b = extra.budget;
+    details.push(
+      b.exhausted
+        ? `plan budget exhausted`
+        : `$${b.remainingUsd.toFixed(2)}/$${b.limitUsd} left this month`,
+    );
   }
   if (pick.backend) details.push(pick.backend);
   if (pick.latencyMs) details.push(`${pick.latencyMs}ms`);
@@ -167,6 +180,7 @@ export async function registerPickTools(
           const pin = runtime.lanePin(l);
           return pin ? `${l}: ${pin}` : `${l}: (none)`;
         });
+        const budgetLines = await runtime.budgetSummary();
         return {
           content: [
             "JEV status",
@@ -176,6 +190,9 @@ export async function registerPickTools(
             `OMO-Slim lanes (${lanes.length}):`,
             ...pins,
             `Candidates: ${runtime.cfg.policy.maxCandidates ?? "default"}`,
+            "",
+            "Plan budget:",
+            ...budgetLines,
             "",
             `Recent picks: ${runtime.cfg.logDecisions ? "logged" : "off"}`,
           ].join("\n"),

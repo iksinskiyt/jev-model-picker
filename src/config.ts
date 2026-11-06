@@ -1,4 +1,11 @@
-import type { BackendConfig, ChatBackendConfig, PickerConfig, SystemOneBackendConfig } from "./types";
+import type {
+  BackendConfig,
+  ChatBackendConfig,
+  PickerConfig,
+  PlanId,
+  SystemOneBackendConfig,
+} from "./types";
+import { PLAN_IDS } from "./limits";
 
 const DEFAULT_SYSTEMONE_BASE = "https://opencode.ai/inference/systemone/v1";
 const DEFAULT_SYSTEMONE_MODEL = "jev-1.13-free";
@@ -88,6 +95,11 @@ export function resolveConfig(options: unknown): PickerConfig {
     if (Array.isArray(refs)) lanes[lane] = refs.map(String);
   }
 
+  // Plan-aware budgeting: Go's per-model monthly caps mean "best model"
+  // has to be qualified by "still has room left this month".
+  const budgetO = asRecord(o.budget) ?? {};
+  const planRaw = String(budgetO.plan ?? "go").toLowerCase();
+
   const descO = asRecord(o.descriptions) ?? {};
   const descriptions: Record<string, string> = {};
   for (const [ref, text] of Object.entries(descO)) {
@@ -112,5 +124,12 @@ export function resolveConfig(options: unknown): PickerConfig {
     omoslimPath: str(o.omoslimPath),
     omoslimPreset: str(o.omoslimPreset),
     logDecisions: bool(o.logDecisions, true),
+    budget: {
+      enabled: bool(budgetO.enabled, true),
+      plan: (PLAN_IDS.includes(planRaw as PlanId) ? planRaw : "go") as PlanId,
+      floorUsd: num(budgetO.floorUsd, 0.5),
+      floorPct: num(budgetO.floorPct, 3),
+      windowAware: bool(budgetO.windowAware, true),
+    },
   };
 }

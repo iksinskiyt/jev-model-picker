@@ -30,6 +30,45 @@ export interface ChatBackendConfig {
 
 export type BackendConfig = SystemOneBackendConfig | ChatBackendConfig;
 
+/** OpenCode Go subscription tier the user pays for. */
+export type PlanId = "go" | "go-plus" | "go-teams";
+
+/**
+ * Plan-aware budgeting policy: with per-model monthly caps, a great model
+ * with an empty bucket is worse than a good model with room left.
+ */
+export interface BudgetPolicy {
+  enabled: boolean;
+  /** Subscription tier — drives the monthly allowance per model. */
+  plan: PlanId;
+  /** Treat a model as unavailable when less than this much USD remains. */
+  floorUsd: number;
+  /** ...or when less than this % of its monthly cap remains. */
+  floorPct: number;
+  /** Also honour the 5h/weekly caps (20%/50% of the monthly allowance). */
+  windowAware: boolean;
+}
+
+/** Live budget picture for one capped model. */
+export interface BudgetInfo {
+  ref: string;
+  limitUsd: number;
+  usedUsd: number;
+  used5h: number;
+  cap5h: number;
+  usedWeek: number;
+  capWeek: number;
+  remainingUsd: number;
+  remainingPct: number;
+  exhausted: boolean;
+}
+
+export interface BudgetSnapshot {
+  asOf: number;
+  plan: PlanId;
+  byRef: Record<string, BudgetInfo>;
+}
+
 export interface PolicyConfig {
   /** Reject a pick whose probability is below this. 0 = accept anything valid. */
   minProbability: number;
@@ -59,6 +98,8 @@ export interface PickerConfig {
   omoslimPath?: string;
   omoslimPreset?: string;
   logDecisions: boolean;
+  /** Prefer models whose plan allowance still has room. */
+  budget: BudgetPolicy;
 }
 
 export interface LaneInfo {
@@ -76,6 +117,8 @@ export interface Candidate {
   description: string;
   /** Blended USD per million tokens ((input+output)/2). 0 for free models. */
   pricePerMTok: number;
+  /** Live plan budget picture, when budget awareness is enabled. */
+  budget?: BudgetInfo;
 }
 
 export interface PickResult {
@@ -95,5 +138,7 @@ export interface DecisionLogEntry {
   candidates: string[];
   pick?: PickResult;
   fallbackModel?: string;
+  /** Candidates withheld because their plan budget is nearly exhausted. */
+  budgetSkipped?: string[];
   error?: string;
 }

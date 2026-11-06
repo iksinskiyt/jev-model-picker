@@ -117,11 +117,19 @@ export async function registerDelegationHook(
 
       // Keep the bar for the after-hook so it lands in session history.
       prunePending();
+      const budget = await runtime.budgetInfo?.(pick.ref);
       pending.set(String(event?.id ?? ""), {
         footer: formatPickFooter(pick, {
           lane: lane ?? "",
           defaultModel,
           ratio,
+          budget: budget
+            ? {
+                remainingUsd: budget.remainingUsd,
+                limitUsd: budget.limitUsd,
+                exhausted: budget.exhausted,
+              }
+            : undefined,
         }),
         ts: Date.now(),
       });

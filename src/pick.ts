@@ -1,4 +1,6 @@
 import type {
+  BudgetInfo,
+  BudgetSnapshot,
   Candidate,
   ChatBackendConfig,
   LaneInfo,
@@ -14,13 +16,39 @@ import { loadOmoslim } from "./omoslim";
 import { logDecision } from "./log";
 import { resolveProviderKey } from "./creds";
 import { readBridge } from "./bridge";
+import {
+  budgetFor,
+  budgetNote,
+  budgetSnapshot,
+  DEFAULT_BUDGET_POLICY,
+  partitionByBudget,
+  resolveBudgetPolicy,
+} from "./limits";
 
 export function buildQuestions(
   candidates: Candidate[],
   lane?: string,
+  budgetNotes?: Record<string, string | undefined>,
+  withheld?: string[],
 ): Record<string, unknown> {
   const criteria: Record<string, string> = {};
-  for (const c of candidates) criteria[c.ref] = c.description;
+  for (const c of candidates) {
+    const note = budgetNotes?.[c.ref];
+    criteria[c.ref] = note ? `${c.description} · ${note}` : c.description;
+  }
+
+  const hasNotes = budgetNotes
+    ? Object.values(budgetNotes).some((n) => !!n)
+    : false;
+
+  let budgetGuidance = "";
+  if (hasNotes) {
+    budgetGuidance +=
+      " Each candidate shows its remaining plan budget in parentheses where known — treat a nearly-exhausted model as unavailable unless nothing else fits.";
+  }
+  if (withheld && withheld.length > 0) {
+    budgetGuidance += ` These models were withheld because their plan budget is nearly exhausted: ${withheld.join(", ")}.`;
+  }
 
   return {
     model: {
@@ -30,7 +58,8 @@ export function buildQuestions(
         (lane
           ? ` The task targets the "${lane}" lane; judge requirements as that lane would.`
           : "") +
-        " Balance quality first, then speed, then cost. Prefer a free or already-available model unless quality clearly demands more.",
+        " Balance quality first, then speed, then cost. Prefer a free or already-available model unless quality clearly demands more." +
+        budgetGuidance,
       criteria,
     },
   };
@@ -124,6 +153,54 @@ export class PickerRuntime {
     return picked / def;
   }
 
+  /**
+   * Cached plan-budget snapshot, or undefined when budgeting is off or the
+   * usage database is unavailable. Never throws.
+   */
+  async budget(): Promise<BudgetSnapshot | undefined> {
+    const policy = resolveBudgetPolicy(
+      this.cfg.budget ?? DEFAULT_BUDGET_POLICY,
+      readBridge().settings?.budget,
+    );
+    if (!policy.enabled) return undefined;
+    try {
+      return await budgetSnapshot({ plan: policy.plan });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Budget info for one ref (the pick's model, for the footer). */
+  async budgetInfo(ref: string): Promise<BudgetInfo | undefined> {
+    const snapshot = await this.budget();
+    return budgetFor(snapshot, ref);
+  }
+
+  /**
+   * Human-readable plan usage for `jev_status`: one line per capped model
+   * that has been touched this period, cheapest-remaining first.
+   */
+  async budgetSummary(): Promise<string[]> {
+    const snapshot = await this.budget();
+    if (!snapshot) return ["budget: disabled"];
+    const policy = resolveBudgetPolicy(
+      this.cfg.budget ?? DEFAULT_BUDGET_POLICY,
+      readBridge().settings?.budget,
+    );
+    const rows = Object.values(snapshot.byRef)
+      .filter((info) => info.usedUsd > 0 || info.exhausted)
+      .sort((a, b) => a.remainingPct - b.remainingPct)
+      .map((info) => {
+        const flags = [info.exhausted ? "exhausted" : undefined].filter(Boolean);
+        const pct = (info.remainingPct * 100).toFixed(0);
+        return `${info.ref}: $${info.usedUsd.toFixed(2)}/$${info.limitUsd} used (${pct}% left${flags.length ? `, ${flags.join(",")}` : ""})`;
+      });
+    const head = `budget: plan=${policy.plan} floor=$${policy.floorUsd}/${policy.floorPct}%${
+      policy.windowAware ? " window-aware" : ""
+    }`;
+    return rows.length ? [head, ...rows] : [head, "(no usage this period)"];
+  }
+
   async recentDecisions(limit = 10): Promise<unknown[]> {
     try {
       const page = await this.ctx?.storage?.scan?.({
@@ -163,6 +240,10 @@ export class PickerRuntime {
     const linked = settings.backend as
       | { baseURL?: string; apiKey?: string; model?: string }
       | undefined;
+    const budgetPolicy = resolveBudgetPolicy(
+      cfg.budget ?? DEFAULT_BUDGET_POLICY,
+      settings.budget,
+    );
 
     const digest = digestTask(taskText, cfg.digest.maxChars);
     if (!digest || digest.length < 16) return undefined;
@@ -173,6 +254,8 @@ export class PickerRuntime {
 
     let candidates: Candidate[] = [];
     let pick: PickResult | undefined;
+    let offered: Candidate[] = [];
+    let budgetSkipped: string[] = [];
     const errors: string[] = [];
 
     try {
@@ -180,8 +263,42 @@ export class PickerRuntime {
         lane,
         allowlist && allowlist.length ? allowlist : undefined,
       );
-      if (candidates.length >= 2) {
-        const questions = buildQuestions(candidates, lane);
+
+      // Live plan budgets: annotate every candidate, then withhold the ones
+      // whose allowance cannot absorb another task. When nothing has room we
+      // offer everything and let the picker choose (a starved pick still beats
+      // falling back to a model that is also exhausted).
+      let snapshot: BudgetSnapshot | undefined;
+      if (budgetPolicy.enabled) {
+        try {
+          snapshot = await budgetSnapshot({ plan: budgetPolicy.plan });
+        } catch {
+          snapshot = undefined;
+        }
+        for (const c of candidates) c.budget = budgetFor(snapshot, c.ref);
+      }
+
+      const { preferred, tight } = partitionByBudget(
+        candidates,
+        snapshot,
+        budgetPolicy,
+      );
+      if (preferred.length >= 2) {
+        offered = preferred;
+        budgetSkipped = tight.map((c) => c.ref);
+      } else {
+        offered = candidates;
+      }
+
+      if (offered.length >= 2) {
+        const notes: Record<string, string | undefined> = {};
+        for (const c of offered) notes[c.ref] = budgetNote(c.budget);
+        const questions = buildQuestions(
+          offered,
+          lane,
+          Object.values(notes).some((n) => !!n) ? notes : undefined,
+          budgetSkipped.length ? budgetSkipped : undefined,
+        );
         const backends = this.backends(linked);
         for (const backend of backends) {
           const startedAt = Date.now();
@@ -189,12 +306,12 @@ export class PickerRuntime {
             let attempt: PickResult | undefined;
             if (backend.kind === "systemone") {
               const resp = await callSystemOne(backend, digest, questions);
-              attempt = decideSystemOne(resp, candidates, cfg);
+              attempt = decideSystemOne(resp, offered, cfg);
               if (attempt) attempt.backend = `systemone:${backend.model}`;
             } else {
               const resolved = await this.resolveChat(backend);
-              const chatPick = await callChat(backend, resolved, digest, candidates);
-              attempt = decideChat(chatPick, candidates, cfg);
+              const chatPick = await callChat(backend, resolved, digest, offered);
+              attempt = decideChat(chatPick, offered, cfg);
               if (attempt) attempt.backend = `chat:${backend.model}`;
             }
             if (attempt) {
@@ -220,9 +337,10 @@ export class PickerRuntime {
       ts: new Date().toISOString(),
       lane,
       digest,
-      candidates: candidates.map((c) => c.ref),
+      candidates: offered.length ? offered.map((c) => c.ref) : candidates.map((c) => c.ref),
       pick,
       fallbackModel: pick ? undefined : this.lanePin(lane),
+      budgetSkipped: budgetSkipped.length ? budgetSkipped : undefined,
       error: pick ? undefined : errors.join(" | ") || undefined,
     });
     return pick;
