@@ -62,10 +62,98 @@ Kimi K3 (1.0), Grok 4.7 >200K (1.25).
 Cost per task is dominated by **cached-read** price, not headline input price (measured from the session DB:
 orchestrator lane averaged 123M input / 286M cached per task).
 
-## Repo state
+## Routing ground truth (7 days, `session_v2` real cost/token columns)
 
-- `src/sessions.ts` session-created interceptor: written, `stopped` scoping bug FIXED (disposer now inside the
-  iterator block), test fixture provider mismatch FIXED.
-- Full suite: **87 pass / 0 fail**, `bunx tsc --noEmit` clean.
-- Uncommitted: `src/index.ts` (registration), `src/sessions.ts`, `test/sessions.test.ts`.
-- Jev is currently **disabled** in `~/.config/opencode/jev-model-picker/state.json` (`enabled: false`, last decision Oct 20).
+| Agent | Sessions | input | cacheRead | output | cost |
+|---|---|---|---|---|---|
+| fixer | 7 | 1,480,113 | **47,805,360** | 151,204 | $0.00 |
+| designer | 10 | 16,710,939 | 29,857,152 | 315,975 | $0.00 |
+| explorer | 4 | 363,149 | 5,849,824 | 28,506 | $0.00 |
+| librarian | 2 | 175,878 | 1,714,496 | 1,984 | $0.00 |
+| observer | 2 | 24,115 | 16,320 | 1,404 | $0.00 |
+| oracle | 2 | 0 | 0 | 0 | — |
+
+**Consequences for the optimiser:**
+1. **Cost is $0 everywhere.** All actual work ran on *free* tiers (`opencode/*-free`, `nvidia/*`). The Go plan —
+   the thing the budget layer currently optimises for — is **not where the work is happening**. Jev's own recent
+   picks (`opencode-go/deepseek-v4.1-flash`, `opencode-go/mimo-v2.6-flash`) aim at a **dead plan**.
+   → The scarce resource is **free-tier quota / rate limits**, not Go dollars.
+2. **cache-read dominates overwhelmingly**: fixer 47.8M cacheRead vs 1.5M input = **32×**. designer 1.8×.
+   Per-task cost is a cache-read prediction problem, not an input-price problem. (Confirms the earlier finding.)
+3. **One model carries a lane**: fixer's 47.8M cacheRead is 46.8M on `nvidia/nemotron-3.5-lightning-30b-a3b`
+   across 3 sessions. Concentration is a single point of failure — exactly what took out GLM-5.3-Flash.
+4. **Ref-shape confirmed in the DB too**: child session rows store
+   `{"providerID":"nvidia","id":"nvidia/nemotron-3.5-lightning-30b-a3b"}` — the **doubled** org prefix is what
+   actually persists. Our config substitutions use that form.
+5. Daily burn peaked Nov 3 (43.5M cacheRead) and is down to 3.9M on Nov 6.
+
+## session-layer interception — live proof it fires
+
+The bridge state file (`~/.config/opencode/jev-model-picker/state.json`) contains four `session-layer` decisions
+recorded from **real background subagent dispatches** on Nov 6, each with the correct lane and the lane's pin as
+`defaultModel`:
+
+| lane | sessionID | Jev picked | pin it replaced |
+|---|---|---|---|
+| explorer | `ses_e4f61bb1bffeNrUgu832koELJL` | `opencode-go/deepseek-v4.1-flash` | `nvidia/z-ai/glm-5.3-flash` |
+| librarian | `ses_e4f61bb1dffeUA0ppaSw8syv0w` | `opencode-go/mimo-v2.6-flash` | `nvidia/z-ai/glm-5.3-flash` |
+| explorer | `ses_e4f88ca63ffevRZfNGe7nzegvs` | `opencode-go/deepseek-v4.1-flash` | `nvidia/z-ai/glm-5.3-flash` |
+| librarian | `ses_e4f88ca69ffe5aZ5w5mBK8lv1r` | `opencode-go/mimo-v2.6-flash` | `nvidia/z-ai/glm-5.3-flash` |
+
+Those are `subagent(...)` calls launched **in the background** (no foreground tool call in the transcript).
+→ **`session.created` fires for background subagent spawns. Proof by observation, not inference.**
+
+Caveat / open item: all four child sessions were aborted before their first assistant turn (0 messages, 0 parts),
+so there is **no billing ground truth yet** proving `switchModel` landed. The `session_v2` row later showed the
+*new* config pin, because OMO-Slim re-pushed the preset onto those still-live children (its own `switchModel`
+path, `index.js:81931-81934`). Billing proof still TODO.
+
+## NIM model quality benchmark (the evidence behind the lane allocation)
+
+Method: 3–4 checkable probes per model against `https://integrate.api.nvidia.com/v1/chat/completions`
+(`max_tokens: 300, temperature: 0`), scoring exact answers. Scripts:
+`scratch/bench.py`, `scratch/bench_current.py`, `scratch/bench2.py`, `scratch/deepseek_probe.py`.
+
+| NIM id | Score | Latency | Note |
+|---|---|---|---|
+| `z-ai/glm-5.3-flash` | 0/4 | **timeout @100s and @240s** | still down after 1.5h |
+| `deepseek-ai/deepseek-v4.1-flash` | — | **timeout @240s ×2** | listed in `/v1/models` but not responding |
+| `z-ai/glm-5.3` | — | HTTP 410 | EOL, "reached its end of life" |
+| `nvidia/nemotron-3.5-lightning-30b-a3b` | — | 3.1s | **returns an EMPTY response** — unusable |
+| `nvidia/nemotron-3-super-120b-a12b` | — | — | HTTP error (not served to this account) |
+| `nvidia/muse-glimmer-30b`, `poolside/laguna-xs-2.1`, `meta/llama-3.1-nemotron-70b-instruct` | — | — | HTTP error (not served) |
+| `minimaxai/minimax-m3.1-flash` | **4/4** | ~75s/req | correct but slow (cold start is not the cause: 71–83s every call) |
+| `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` | 3/3 | **0.75s** | fastest correct model |
+| `nvidia/nemotron-3.5-super-vl-120b-a12b` | 3/3 | 2.96s | vision (VL) |
+| `stepfun-ai/step-5-preview` | 3/3 | 2.67s | |
+| `nvidia/nemotron-3-ultra-550b-a55b` | 3/3 | 4.8s | most capable free model |
+
+**Ref-shape gotcha (cost me a benchmark run)**: the raw NIM API needs the *bare* id
+(`nvidia/nemotron-3-ultra-550b-a55b`), while OpenCode's catalog and the OMO config write the *doubled*
+form (`nvidia/nvidia/nemotron-3-ultra-550b-a55b`). Passing the doubled form to NIM returns HTTP errors that
+look exactly like "model not served" — so a benchmark must use the bare id or it wrongly fails 6/6 models.
+
+### Final `nim` preset allocation (all verified)
+
+| Lane | Model | Why |
+|---|---|---|
+| orchestrator | `stepfun-ai/step-5-preview` | 3/3, 2.7s — unchanged |
+| designer | `stepfun-ai/step-5-preview` | 3/3, 2.7s — unchanged |
+| oracle | `nvidia/nemotron-3-ultra-550b-a55b` | 3/3, 4.8s, most capable — unchanged |
+| **explorer** | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` | 3/3, **0.75s** — highest-volume lane wants throughput |
+| **librarian** | `nvidia/minimaxai/minimax-m3.1-flash` | **4/4** best quality; lowest volume (2 sessions/7d) so 75s is tolerable |
+| **fixer** | `nvidia/nemotron-3-ultra-550b-a55b` | 3/3, 4.8s — removed the broken Lightning-30B |
+| **observer** | `nvidia/nemotron-3.5-super-vl-120b-a12b` | 3/3, 2.9s, only VL option — needed for image/PDF analysis |
+
+Deliberate spread: no model carries more than two lanes. The previous allocation put the *broken*
+`nemotron-3.5-lightning-30b-a3b` on both explorer and fixer, and left librarian/observer on dead GLM refs.
+
+**Note**: the `zen-free` preset's `opencode/glm-5.3-flash-free` is a *different provider* (OpenCode's own
+free tier), was working in the DB (7.9M cacheRead on designer), and is unaffected by the NIM outage.
+
+## Defect found: tests pollute the user's live bridge state
+
+`test/sessions.test.ts` triggers `recordDecisionToBridge`, which writes to
+`~/.config/opencode/jev-model-picker/state.json`. The user's real state file is full of test fixtures
+(`ses_child_variant`, `c5`, `c4`, `child_1`…). Needs an env-gated/`configDir` seam so tests never touch live state.
+
