@@ -3,6 +3,7 @@ import { resolveConfig } from "./config";
 import { PickerRuntime } from "./pick";
 import { registerDelegationHook } from "./hook";
 import { registerPickTools } from "./tool";
+import { registerSessionInterceptor } from "./sessions";
 
 /**
  * jev-model-picker — OpenCode V2 plugin.
@@ -26,6 +27,10 @@ export default Plugin.define({
       await runtime.init();
       await registerPickTools(ctx, runtime);
       await registerDelegationHook(ctx, runtime);
+      // Session-layer interception: background subagents and OMO-Slim's revived
+      // tasks never reach the tool hook, so the same decision is applied to
+      // every child session on session.created.
+      await registerSessionInterceptor(ctx, runtime);
 
       const lanes = runtime.laneNames();
       const backends =
