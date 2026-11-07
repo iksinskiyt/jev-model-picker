@@ -99,6 +99,8 @@ export class PickerRuntime {
     preset?: string;
     presets: Record<string, Record<string, LaneInfo>>;
   };
+  /** When `omoslim` was last read from disk (see laneMap). */
+  private omoslimReadAt = 0;
 
   constructor(ctx: any, cfg: PickerConfig) {
     this.ctx = ctx;
@@ -114,6 +116,18 @@ export class PickerRuntime {
   }
 
   private laneMap(): Record<string, LaneInfo> | undefined {
+    // Re-read the OMO config on the policy TTL. Loading it once in init() froze
+    // the lanes at startup, so a lane-pin edit had no effect until OpenCode
+    // restarted - which reads as "my config change did nothing".
+    const now = Date.now();
+    if (now - this.omoslimReadAt > this.cfg.policy.cacheTtlMs) {
+      try {
+        this.omoslim = loadOmoslim(this.cfg.omoslimPath);
+      } catch {
+        this.omoslim = undefined;
+      }
+      this.omoslimReadAt = now;
+    }
     const presets = this.omoslim?.presets ?? {};
     const preset = this.cfg.omoslimPreset ?? this.omoslim?.preset;
     if (preset && presets[preset]) return presets[preset];

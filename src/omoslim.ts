@@ -27,12 +27,25 @@ export function parseOmoslim(text: string): OmoslimConfig | undefined {
       if (!lanes || typeof lanes !== "object") continue;
       const map: Record<string, LaneInfo> = {};
       for (const [lane, value] of Object.entries<any>(lanes)) {
-        const model = typeof value?.model === "string" ? value.model : undefined;
+        // `model` is either a plain string ("nvidia/x") or the array form
+        // ("model": [{"id": ..., "variant": ...}, ...]) that the opencode-go
+        // preset uses. Returning undefined for the array form silently skipped
+        // every such lane, which made those presets invisible to the picker.
+        const primary = Array.isArray(value?.model) ? value.model[0] : undefined;
+        const model =
+          typeof value?.model === "string"
+            ? value.model
+            : primary && typeof primary.id === "string"
+              ? primary.id
+              : undefined;
         if (!model) continue;
-        map[lane] = {
-          model,
-          variant: typeof value?.variant === "string" ? value.variant : undefined,
-        };
+        const variant =
+          typeof value?.variant === "string"
+            ? value.variant
+            : primary && typeof primary.variant === "string"
+              ? primary.variant
+              : undefined;
+        map[lane] = { model, variant };
       }
       presets[name] = map;
     }
