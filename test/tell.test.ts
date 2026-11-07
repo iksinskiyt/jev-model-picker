@@ -146,6 +146,46 @@ test("summarizeSubstitutions with empty list", () => {
   expect(summarizeSubstitutions([])).toBe("No substitutions recorded.");
 });
 
+test("sidebar tell pipeline: session subs most-recent-first, max 3, pin-kept excluded", () => {
+  const mk = (lane: string, from: string | undefined, ts: number): BridgeDecision => ({
+    ts,
+    sessionID: "ses_live",
+    model: "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b-a3b",
+    defaultModel: from,
+    probability: 0.8,
+    margin: 0.1,
+    reason: "cheap",
+    backend: "session-layer",
+    lane,
+    task: "work",
+    pickedPrice: 0,
+    defaultPrice: 5,
+  });
+  // Mirrors subsFor() in src/tui/index.tsx: map, drop preset-kept, take 3.
+  const decisions = [
+    mk("explorer", "nvidia/z-ai/glm-5.3-flash", 4),
+    mk("fixer", "nvidia/z-ai/glm-5.3-flash", 3),
+    mk("oracle", "nvidia/z-ai/glm-5.3-flash", 2),
+    mk("librarian", "nvidia/z-ai/glm-5.3-flash", 1),
+    // Pin kept: model equals default — must never render as a substitution.
+    {
+      ...mk("fixer", "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b-a3b", 5),
+      model: "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b-a3b",
+    },
+  ];
+  const subs = decisions
+    .map((d) => substitutionFromDecision(d))
+    .filter((s) => s.source !== "preset-kept")
+    .slice(0, 3);
+  expect(subs.length).toBe(3);
+  for (const s of subs) {
+    const line = formatSubstitution(s);
+    expect(line).toContain("SUBSTITUTED");
+    expect(line).toContain("→");
+  }
+  expect(subs.some((s) => s.lane === "librarian")).toBe(false); // 4th, cut off
+});
+
 test("summarizeSubstitutions with multiple decisions", () => {
   const decisions: BridgeDecision[] = [
     {

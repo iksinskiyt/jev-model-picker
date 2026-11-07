@@ -25,7 +25,8 @@ import {
  * - session transcript: a probability bar footer per delegation (src/hook.ts)
  * - right sidebar: ONE row in OpenCode's sidebar design language — status
  *   glyph on the left, bold "JEV" label, then the last delegated prompt of
- *   THIS session as a one-liner; a muted "saved" line under it.
+ *   THIS session as a one-liner; live substitution tells (lane → from → to,
+ *   or PIN KEPT) plus a muted "saved" line under it.
  *   Glyphs follow OMO-Slim: braille spinner while working, ✦ star after a
  *   recent pick, • idle.
  * - session panel (right side): status + the last delegated prompt of this
@@ -267,6 +268,34 @@ export default Plugin.define({
     const savedOf = (d: BridgeDecision) => savedByTs.get(d.ts) ?? d.saved ?? 0
     const savedFor = (sessionID: string | undefined): number =>
       decisionsFor(sessionID).reduce((sum, d) => sum + savedOf(d), 0)
+
+    // ------------------------------------------------------------ sub-tell lines
+    /**
+     * Live reroutes in THIS session, most recent first (max 3 sidebar rows).
+     * Derived from the same bridge decisions as the header row — no new
+     * source. Never throws: a bad decision renders nothing instead of
+     * breaking the sidebar.
+     */
+    const subsFor = (sessionID: string | undefined): Substitution[] => {
+      try {
+        return decisionsFor(sessionID)
+          .map((d) => substitutionFromDecision(d))
+          .filter((s) => s.source !== "preset-kept")
+          .slice(0, 3)
+      } catch {
+        return []
+      }
+    }
+
+    /** One tell line via tell.ts (lane, SUBSTITUTED/PIN KEPT, arrow, reason). */
+    const subLine = (sub: Substitution): string => {
+      try {
+        if (!sub || typeof (sub as Substitution).lane !== "string") return "· jev working"
+        return `· ${formatSubstitution(sub)}`
+      } catch {
+        return "· jev working"
+      }
+    }
 
     // ------------------------------------------------------------ glyph logic
 
@@ -529,8 +558,9 @@ export default Plugin.define({
 
     /**
      * One row, OpenCode sidebar style: glyph on the left, bold label, and the
-     * last delegated prompt of THIS session as a one-liner; a muted per
-     * session "saved" line under it. Clicking the row opens the status panel.
+     * last delegated prompt of THIS session as a one-liner; live substitution
+     * tells (lane → from → to) under it, then a muted per session "saved"
+     * line. Clicking the row opens the status panel.
      */
     ui.slot({
       append: "sidebar.content",
@@ -545,6 +575,13 @@ export default Plugin.define({
         const picks = decisionsFor(sessionID)
         const last = picks[0]
         const prompt = last?.task ? oneLine(last.task) : ""
+        const subs = subsFor(sessionID)
+        // Pin kept (a decline) must not look like a substitution — render the
+        // lane's own PIN KEPT line instead of going quiet.
+        const keptLine =
+          picks.length > 0 && subs.length === 0 && last
+            ? subLine(substitutionFromDecision(last))
+            : undefined
         if (picks.length > 0 && Date.now() - budgetAt > SAVINGS_POLL_MS * 5) {
           budgetAt = Date.now()
           void refreshBudgetLine(sessionID)
@@ -572,10 +609,17 @@ export default Plugin.define({
                 </span>
               </text>
             </box>
-            {/* SUBSTITUTION TELL — most recent from → to */}
-            <Show when={recentSub() !== null}>
+            {/* SUBSTITUTION TELLS — live reroutes in THIS session, lane → from → to */}
+            <For each={subs}>
+              {(sub) => (
+                <text fg={muted} wrapMode="none" truncate flexShrink={0}>
+                  {subLine(sub)}
+                </text>
+              )}
+            </For>
+            <Show when={keptLine}>
               <text fg={muted} wrapMode="none" truncate flexShrink={0}>
-                {`· ${recentSub()!.from} → ${recentSub()!.to}`}
+                {keptLine}
               </text>
             </Show>
             <Show when={saved > 0}>
