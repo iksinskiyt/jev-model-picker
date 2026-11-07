@@ -5,8 +5,9 @@ import { createSignal, For, Show, onCleanup, onMount } from "solid-js"
 import { TextAttributes } from "@opentui/core"
 import { counterfactualGain, readBridge, writeBridge } from "../bridge"
 import type { BridgeDecision, BridgeState } from "../bridge"
-import type { Substitution } from "../tell"
+import type { Substitution, SubstitutionBrief } from "../tell"
 import {
+  briefSubstitution,
   formatSubstitution,
   summarizeSubstitutions,
   substitutionFromDecision,
@@ -25,12 +26,14 @@ import {
  * - session transcript: a probability bar footer per delegation (src/hook.ts)
  * - right sidebar: ONE row in OpenCode's sidebar design language — status
  *   glyph on the left, bold "JEV" label, then the last delegated prompt of
- *   THIS session as a one-liner; live substitution tells (lane → from → to,
- *   or PIN KEPT) plus a muted "saved" line under it.
- *   Glyphs follow OMO-Slim: braille spinner while working, ✦ star after a
- *   recent pick, • idle.
+ *   THIS session as a one-liner; live substitution tells under it as two
+ *   rows that fit the ~40 column sidebar (the lane, then `from → to` with
+ *   both model names cut to their distinguishing part), then a muted "saved"
+ *   line. Glyphs follow OMO-Slim: braille spinner while working, ✦ star
+ *   after a recent pick, • idle.
  * - session panel (right side): status + the last delegated prompt of this
- *   session, full width — no models, no probabilities
+ *   session, plus the complete untruncated substitution lines — the same
+ *   ones /jev-sub lists and the transcript keeps.
  *
  * Everything shown is scoped to the current session (its root family), and
  * the cost estimate is per session.
@@ -43,6 +46,14 @@ const BRIDGE_WRITE_DEBOUNCE_MS = 2000
 const ATTRIBUTION_WINDOW_MS = 30 * 60 * 1000
 const WORKING_WINDOW_MS = 60 * 1000
 const PICKER_PAGE_ROWS = 11
+
+/**
+ * Sidebar rows are cut to this width. OpenCode's sidebar column is roughly
+ * 40 columns wide, so 36 leaves slack for its borders: every sidebar string
+ * is built by `briefSubstitution()` against this budget and is measured in
+ * test/tell.test.ts.
+ */
+const SIDEBAR_WIDTH = 36
 
 // Braille activity frames, same set the OMO-Slim sidebar animates.
 const ACTIVITY_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇", "⠉", "⠏"]
@@ -287,14 +298,35 @@ export default Plugin.define({
       }
     }
 
-    /** One tell line via tell.ts (lane, SUBSTITUTED/PIN KEPT, arrow, reason). */
-    const subLine = (sub: Substitution): string => {
+    /**
+     * One substitution as two rows that fit the sidebar column: the lane in
+     * muted, then `from → to` in base — the answer to "which model replaced
+     * which" — with full refs left to the panel and /jev-sub. Either row
+     * opens the panel, like the JEV header row. Never throws.
+     */
+    const subRows = (sub: Substitution) => {
+      let brief: SubstitutionBrief
       try {
-        if (!sub || typeof (sub as Substitution).lane !== "string") return "· jev working"
-        return `· ${formatSubstitution(sub)}`
+        brief = briefSubstitution(sub, SIDEBAR_WIDTH)
       } catch {
-        return "· jev working"
+        brief = { laneLine: "· jev", modelLine: "  substitution", kept: false }
       }
+      return (
+        <box
+          flexDirection="column"
+          onMouseUp={() => {
+            if (isSelecting()) return
+            openPanel()
+          }}
+        >
+          <text fg={ctx.theme?.text?.muted} wrapMode="none" truncate flexShrink={0}>
+            {brief.laneLine}
+          </text>
+          <text fg={ctx.theme?.text?.base} wrapMode="none" truncate flexShrink={0}>
+            {brief.modelLine}
+          </text>
+        </box>
+      )
     }
 
     // ------------------------------------------------------------ glyph logic
@@ -559,8 +591,9 @@ export default Plugin.define({
     /**
      * One row, OpenCode sidebar style: glyph on the left, bold label, and the
      * last delegated prompt of THIS session as a one-liner; live substitution
-     * tells (lane → from → to) under it, then a muted per session "saved"
-     * line. Clicking the row opens the status panel.
+     * tells under it as two rows that fit the column (lane, then from → to
+     * short enough to read), then a muted per session "saved" line. Clicking
+     * any of the rows opens the status panel, which carries the full refs.
      */
     ui.slot({
       append: "sidebar.content",
@@ -578,10 +611,8 @@ export default Plugin.define({
         const subs = subsFor(sessionID)
         // Pin kept (a decline) must not look like a substitution — render the
         // lane's own PIN KEPT line instead of going quiet.
-        const keptLine =
-          picks.length > 0 && subs.length === 0 && last
-            ? subLine(substitutionFromDecision(last))
-            : undefined
+        const kept =
+          picks.length > 0 && subs.length === 0 && last ? substitutionFromDecision(last) : undefined
         if (picks.length > 0 && Date.now() - budgetAt > SAVINGS_POLL_MS * 5) {
           budgetAt = Date.now()
           void refreshBudgetLine(sessionID)
@@ -609,19 +640,11 @@ export default Plugin.define({
                 </span>
               </text>
             </box>
-            {/* SUBSTITUTION TELLS — live reroutes in THIS session, lane → from → to */}
-            <For each={subs}>
-              {(sub) => (
-                <text fg={muted} wrapMode="none" truncate flexShrink={0}>
-                  {subLine(sub)}
-                </text>
-              )}
-            </For>
-            <Show when={keptLine}>
-              <text fg={muted} wrapMode="none" truncate flexShrink={0}>
-                {keptLine}
-              </text>
-            </Show>
+            {/* SUBSTITUTION TELLS — live reroutes in THIS session, lane then from → to */}
+            <For each={subs}>{(sub) => subRows(sub)}</For>
+            {/* Pin kept (a decline) must not look like a substitution — render it
+                as its own PIN KEPT row instead of going quiet. */}
+            <Show when={kept}>{(sub: Substitution) => subRows(sub)}</Show>
             <Show when={saved > 0}>
               <text fg={muted} wrapMode="none" truncate flexShrink={0}>
                 {`saved $${saved.toFixed(4)}`}
@@ -650,6 +673,7 @@ export default Plugin.define({
       const s = statusFor(sid)
       const picks = decisionsFor(sid)
       const last = picks[0]
+      const subs = subsFor(sid)
       if (picks.length > 0 && Date.now() - budgetAt > SAVINGS_POLL_MS * 5) {
         budgetAt = Date.now()
         void refreshBudgetLine(sid)
@@ -687,6 +711,20 @@ export default Plugin.define({
               </>
             )}
           </Show>
+          {/* The sidebar names both models in short; the full refs and the
+              reason live here, wrapped so nothing is cut off. */}
+          <Show when={subs.length > 0}>
+            <box flexDirection="column">
+              <text fg={muted}>substitutions this session</text>
+              <For each={subs}>
+                {(sub) => (
+                  <text fg={muted} wrapMode="word">
+                    {formatSubstitution(sub)}
+                  </text>
+                )}
+              </For>
+            </box>
+          </Show>
           <text fg={accent} attributes={TextAttributes.BOLD}>
             {`saved $${savedFor(sid).toFixed(4)}`}
           </text>
@@ -695,7 +733,7 @@ export default Plugin.define({
               {budgetLine()}
             </text>
           </Show>
-          <text fg={muted}>esc close · probability bars stay in the transcript</text>
+          <text fg={muted}>esc close · full model refs: /jev-sub</text>
         </box>
       )
     }

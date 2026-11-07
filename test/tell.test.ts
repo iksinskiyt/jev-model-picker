@@ -1,10 +1,112 @@
 import { expect, test } from "bun:test";
 import {
+  briefSubstitution,
   formatSubstitution,
   summarizeSubstitutions,
   substitutionFromDecision,
 } from "../src/tell";
 import { BridgeDecision } from "../src/bridge";
+
+/** The sidebar column is ~40 wide; every brief row must fit 36. */
+const SIDEBAR_WIDTH = 36;
+
+test("briefSubstitution fits the sidebar and names both models", () => {
+  const s: Substitution = {
+    lane: "explorer",
+    from: "nvidia/z-ai/glm-5.3-flash",
+    to: "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    reason: "deep bucket, cheap per task",
+    probability: 0.82,
+    source: "tool-hook",
+  };
+  const brief = briefSubstitution(s);
+  expect(brief.kept).toBe(false);
+  expect(brief.laneLine).toBe("· explorer");
+  expect(brief.modelLine).toBe("  glm-flash → nemotron-nano-omni…");
+  // Measured widths — the point of the brief is that nothing is cut off.
+  expect(brief.laneLine.length).toBe(10);
+  expect(brief.modelLine.length).toBe(33);
+  expect(Math.max(brief.laneLine.length, brief.modelLine.length)).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+  // Both models are legible: no provider path, no version/size noise.
+  expect(brief.modelLine).toContain("glm");
+  expect(brief.modelLine).toContain("nemotron-nano-omni");
+  expect(brief.modelLine).not.toContain("nvidia/");
+  expect(brief.modelLine).not.toContain("a3b");
+  // Detail was moved, not deleted: the full line still exists for the panel,
+  // with the provider paths the brief drops (its own 48-char ref cap intact).
+  const full = formatSubstitution(s);
+  expect(full).toContain("nvidia/z-ai/glm-5.3-flash");
+  expect(full).toContain("nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reaso");
+  expect(full).toContain("deep bucket, cheap per task");
+  expect(full).toContain("82%");
+  expect(full.length).toBeGreaterThan(brief.modelLine.length);
+});
+
+test("briefSubstitution rows fit the sidebar width for realistic pairs", () => {
+  const pairs: Array<[string, string]> = [
+    ["nvidia/z-ai/glm-5.3-flash", "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"],
+    ["opencode-go/deepseek-v4.1-flash", "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b"],
+    ["nvidia/nvidia/nemotron-3.5-lightning-30b-a3b-a3b", "opencode/c"],
+    ["nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b", "nvidia/z-ai/glm-5.3-flash"],
+    ["anthropic/claude-sonnet-4.5", "openai/gpt-5.1-codex-max"],
+    ["a", "b"],
+    ["", ""],
+    ["?", "?"],
+  ];
+  for (const [from, to] of pairs) {
+    for (const lane of ["explorer", "librarian", "subagent-executor"]) {
+      const brief = briefSubstitution({ lane, from, to, reason: "cheap", source: "tool-hook" });
+      expect(brief.laneLine.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+      expect(brief.modelLine.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+    }
+  }
+});
+
+test("briefSubstitution marks every shortening with an ellipsis", () => {
+  const long = "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning-ultra-preview";
+  const brief = briefSubstitution({
+    lane: "oracle",
+    from: "nvidia/z-ai/glm-5.3-flash",
+    to: long,
+    reason: "r",
+    source: "tool-hook",
+  });
+  expect(brief.modelLine).toContain("nemotron");
+  // trailing tokens were dropped, so the cut says so instead of hiding it
+  expect(brief.modelLine.endsWith("…")).toBe(true);
+  expect(brief.modelLine.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+});
+
+test("briefSubstitution renders PIN KEPT distinctly", () => {
+  const brief = briefSubstitution({
+    lane: "fixer",
+    from: "?",
+    to: "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b",
+    reason: "JEV declined",
+    source: "preset-kept",
+  });
+  expect(brief.kept).toBe(true);
+  expect(brief.laneLine).toBe("· fixer");
+  expect(brief.modelLine).toBe("  PIN KEPT nemotron-super-vl");
+  expect(brief.modelLine).not.toContain("→");
+  expect(brief.modelLine.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+});
+
+test("briefSubstitution degrades safely on malformed input", () => {
+  for (const bad of [null, undefined, {}, 42, "nope"] as any[]) {
+    const brief = briefSubstitution(bad);
+    expect(brief.laneLine).toBeDefined();
+    expect(brief.modelLine).toBeDefined();
+    expect(brief.laneLine.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+    expect(brief.modelLine.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+  }
+  const noFields = briefSubstitution({} as any);
+  expect(noFields.modelLine).toBe("  ? → ?");
+  expect(noFields.laneLine).toBe("· jev");
+  // absurd widths still render a line, never a throw
+  expect(briefSubstitution({ lane: "explorer", from: "a", to: "b", reason: "r", source: "tool-hook" }, 0).modelLine.length)
+    .toBeLessThanOrEqual(SIDEBAR_WIDTH);
+});
 
 test("formatSubstitution produces the canonical substitution line", () => {
   const s: Substitution = {

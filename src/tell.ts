@@ -130,6 +130,104 @@ export function substitutionFromDecision(d: BridgeDecision): Substitution {
 }
 
 /**
+ * Sidebar brief: the same substitution, cut to what a ~36 column row can
+ * carry — the lane, and the distinguishing part of both model names. The
+ * full refs stay in `formatSubstitution()` (panel, transcript, /jev-sub).
+ */
+const SIDEBAR_WIDTH = 36
+
+/**
+ * Ref tokens that are noise at sidebar width: a version (`3`, `3.5`, `v4.1`)
+ * or a size (`30b`, `120b`, `a3b`). Family and variant tokens are what tell
+ * two candidates apart.
+ */
+const NOISE_TOKEN = /^(v?\d+(\.\d+)*|\d+(\.\d+)?[bB]?|a\d+(\.\d+)?[bB]?)$/
+
+export type SubstitutionBrief = {
+  /** lane row, e.g. `· explorer` */
+  laneLine: string
+  /** model row, e.g. `  glm-flash → nemotron-nano-omni…` */
+  modelLine: string
+  /** true when the lane's pin was kept, false when a substitution happened */
+  kept: boolean
+}
+
+/** Hard cut that always says so: never a silent mid-name chop. */
+function clipText(text: string, max: number): string {
+  if (max <= 1) return "…"
+  if (text.length <= max) return text
+  return `${text.substring(0, max - 1)}…`
+}
+
+/** `nvidia/z-ai/glm-5.3-flash` → `glm-5.3-flash` — the provider path is noise here. */
+function lastSegment(ref: string): string {
+  const parts = ref.split("/")
+  return parts[parts.length - 1] || ref
+}
+
+/** Last segment with version/size tokens dropped, uncapped. */
+function cleanRef(ref: string): string {
+  const segment = lastSegment(String(ref ?? "").trim())
+  if (!segment) return ""
+  const tokens = segment.split("-").filter((t) => t && !NOISE_TOKEN.test(t))
+  // A ref that is all noise ("30b") still has to render as itself.
+  return tokens.length > 0 ? tokens.join("-") : segment
+}
+
+/**
+ * Shorten a model ref to at most `max` chars. Tokens are dropped from the end
+ * until a trailing `…` fits, so the cut is always marked; only a single
+ * oversized token is ever cut mid-word.
+ */
+function shortRef(ref: string, max: number): string {
+  const full = cleanRef(ref)
+  if (!full) return "?"
+  if (max <= 1) return "…"
+  if (full.length <= max) return full
+  let out = full
+  while (out.includes("-") && out.length + 1 > max) {
+    out = out.slice(0, out.lastIndexOf("-"))
+  }
+  return out.length + 1 <= max ? `${out}…` : clipText(out, max)
+}
+
+/**
+ * Sidebar-sized rendering of a substitution: two rows that name the lane and
+ * both models inside `width` columns, with the replacement readable without
+ * clicking anything. Malformed input degrades to a plain, short line.
+ *
+ * A substitution:
+ *   · explorer
+ *     glm-flash → nemotron-nano-omni…
+ */
+export function briefSubstitution(s: Substitution, width = SIDEBAR_WIDTH): SubstitutionBrief {
+  try {
+    const w = Math.max(12, Math.floor(width))
+    const lane = clipText(String(s?.lane ?? "").trim(), w - 2) || "jev"
+    const kept = s?.source === "preset-kept"
+    // Both rows share `width`: row 2 is an indent plus " → " of chrome.
+    const budget = Math.max(8, w - 5)
+    const half = Math.floor(budget / 2)
+    const from = cleanRef(String(s?.from ?? ""))
+    const to = cleanRef(String(s?.to ?? ""))
+    // The shorter ref lends its slack to the other; `to` keeps at least 4.
+    const capFrom = Math.min(from.length, Math.max(half, budget - to.length), budget - 4)
+    const capTo = Math.max(4, budget - capFrom)
+    // The replacement is the answer, so a short `from` lends it the slack.
+    return {
+      laneLine: `· ${lane}`,
+      modelLine: kept
+        ? `  PIN KEPT ${shortRef(String(s?.to ?? ""), capTo)}`
+        : `  ${shortRef(String(s?.from ?? ""), capFrom)} → ${shortRef(String(s?.to ?? ""), capTo)}`,
+      kept,
+    }
+  } catch {
+    // Never throw — a malformed decision degrades to a plain line
+    return { laneLine: "· jev", modelLine: "  substitution", kept: false }
+  }
+}
+
+/**
  * Aggregate multiple substitutions into a multi-line summary string.
  * Used for display in a panel or sidebar — one line per substitution,
  * ordered most recent first (up to 10).
