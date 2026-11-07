@@ -1,0 +1,4 @@
+[test]
+# One owner for JEV_MODEL_PICKER_STATE, so test files cannot race over the
+# bridge state directory (see test/setup.ts).
+preload = ["./test/setup.ts"]

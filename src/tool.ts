@@ -1,4 +1,5 @@
 import type { PickerRuntime } from "./pick";
+import { formatQuality, qualityByLane } from "./outcomes";
 import { formatSubstitution, substitutionFromDecision } from "./tell";
 
 const PICK_INPUT_SCHEMA = {
@@ -245,6 +246,51 @@ export async function registerPickTools(
             ...budgetLines,
             "",
             `Recent picks: ${runtime.cfg.logDecisions ? "logged" : "off"}`,
+          ].join("\n"),
+        };
+      },
+    });
+    editor.add({
+      name: "jev_quality",
+      description:
+        "Show measured task outcomes per model and per lane: solved rate, failures, median duration, tokens per SOLVED task, and tokens wasted per failed attempt. This is the signal that tells you whether a cheap model is actually cheaper - a model that fails often costs more per solved task than a stronger one that finishes first try.",
+      input: STATUS_INPUT_SCHEMA,
+      execute: async () => {
+        const outcomes = await runtime.outcomes();
+        if (outcomes.length === 0) {
+          return {
+            content:
+              "no delegated tasks measured yet\n\n" +
+              "Outcomes come from OpenCode's session DB (session_v2.idle_outcome).",
+          };
+        }
+        const byModel = await runtime.quality();
+        const rows = formatQuality(byModel);
+        // Per lane tells you where the waste is concentrated.
+        const byLane = qualityByLane(outcomes);
+        const total = outcomes.length;
+        const solved = outcomes.filter((o) => o.outcome === "succeeded").length;
+        const wasted = outcomes
+          .filter((o) => o.outcome !== "succeeded")
+          .reduce(
+            (a, o) => a + o.tokensInput + o.tokensOutput + o.tokensCacheRead,
+            0,
+          );
+        return {
+          content: [
+            `JEV quality — ${solved}/${total} tasks solved ` +
+              `(${((solved / total) * 100).toFixed(0)}%)`,
+            `tokens burned on tasks that did NOT solve: ${Math.round(wasted).toLocaleString("en-US")}`,
+            "",
+            "BY MODEL (solved%, ok/fail/int, median, tokens per SOLVED task, wasted per attempt):",
+            rows,
+            "",
+            "BY LANE:",
+            formatQuality(byLane, 8),
+            "",
+            "High 'wasted per attempt' is the false-economy signal: the model is",
+            "cheap per token but burns tokens failing, so it costs more per",
+            "solved task than a stronger model would.",
           ].join("\n"),
         };
       },

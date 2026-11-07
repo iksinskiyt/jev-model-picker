@@ -145,6 +145,12 @@ export interface Candidate {
   pricePerMTok: number;
   /** Live plan budget picture, when budget awareness is enabled. */
   budget?: BudgetInfo;
+  /**
+   * Measured failure signal for this model, 0..5. Derived from real session
+   * outcomes (see src/outcomes.ts): how often tasks it handled did not succeed,
+   * and how many tokens those failures burned. Higher means it flailed here.
+   */
+  flail?: number;
 }
 
 export interface PickResult {

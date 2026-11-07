@@ -182,6 +182,8 @@ export interface ScoringWeights {
    * marginally-cheaper alternative unless the evidence is clearly against it.
    */
   pinBonus: number;
+  /** Penalty per unit of measured flail (0..5, from real session outcomes). */
+  flailPenalty: number;
 }
 
 export const DEFAULT_WEIGHTS: ScoringWeights = {
@@ -197,6 +199,9 @@ export const DEFAULT_WEIGHTS: ScoringWeights = {
   // Big enough that a healthy pin beats a free-but-marginal alternative, small
   // enough that a genuinely unhealthy pin still loses to a healthy model.
   pinBonus: 8,
+  // Tuned so the worst measured model (flail 5) loses ~15 points - enough to
+  // drop behind a healthy pin, never enough to beat the health penalties.
+  flailPenalty: 3,
 };
 
 /** Task complexity heuristic — determines if work is "ordinary" or "hard". */
@@ -277,6 +282,8 @@ export interface ScoreBreakdown {
   offPeak: number;
   /** Bonus for matching the lane's configured pin (0 when it is not the pin). */
   pin: number;
+  /** Measured-flail penalty (0 when the model has no measured history). */
+  flail: number;
 }
 
 export function scoreCandidate(
@@ -357,6 +364,16 @@ export function scoreCandidate(
     pinScore = opts.weights.pinBonus;
   }
 
+  // --- Measured flail penalty ---
+  // The outcome feedback term (src/outcomes.ts): this model has actually been
+  // observed failing on this stack. Small and capped, so it nudges rather than
+  // decides - it can never outvote capacity or health, and a model with no
+  // measured history is not penalised at all.
+  let flailScore = 0;
+  if (typeof candidate.flail === "number" && candidate.flail > 0) {
+    flailScore = -candidate.flail * opts.weights.flailPenalty;
+  }
+
   // --- Budget exhaustion check (hard constraint) ---
   if (opts.budgetSnapshot && opts.budgetPolicy.enabled) {
     const budgetInfo = budgetFor(opts.budgetSnapshot, candidate.ref);
@@ -373,7 +390,8 @@ export function scoreCandidate(
     concentrationScore +
     premiumScore +
     offPeakScore +
-    pinScore;
+    pinScore +
+    flailScore;
 
   return {
     total,
@@ -384,6 +402,7 @@ export function scoreCandidate(
     premium: premiumScore,
     offPeak: offPeakScore,
     pin: pinScore,
+    flail: flailScore,
   };
 }
 

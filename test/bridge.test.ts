@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   bridgeDirectory,
   bridgeFile,
@@ -14,8 +14,10 @@ import {
 import { listCandidates } from "../src/catalog";
 import { resolveConfig } from "../src/config";
 
-const dir = join(tmpdir(), `jev-bridge-test-${process.pid}`);
-process.env.JEV_MODEL_PICKER_STATE = dir;
+// The bridge directory comes from the preload (test/setup.ts) via
+// JEV_MODEL_PICKER_STATE. Do not reassign it here: reassigning is what made
+// this file race with the other test files.
+const dir = bridgeDirectory();
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });

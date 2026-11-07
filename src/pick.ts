@@ -28,6 +28,7 @@ import {
   resolveBudgetPolicy,
 } from "./limits";
 import { getGlobalConcentration } from "./catalog";
+import { readTaskOutcomes, flailScore, qualityByModel, type TaskOutcome, type ModelQuality } from "./outcomes";
 
 export function buildQuestions(
   candidates: Candidate[],
@@ -91,6 +92,9 @@ export class PickerRuntime {
   readonly cfg: PickerConfig;
   private readonly ctx: any;
   private readonly cache = new Map<string, { t: number; pick?: PickResult }>();
+  /** Measured task outcomes, cached for the policy TTL (see outcomes()). */
+  private outcomeCache: TaskOutcome[] = [];
+  private outcomeCacheAt = 0;
   private omoslim?: {
     preset?: string;
     presets: Record<string, Record<string, LaneInfo>>;
@@ -221,6 +225,30 @@ export class PickerRuntime {
     return rows.length ? [head, ...rows] : [head, "(no usage this period)"];
   }
 
+  /**
+   * Cached task-outcome feed, read at most once per policy cache window.
+   * The session DB is opened read-only; a miss or a lock yields [] and the
+   * picker behaves exactly as it did before outcomes existed.
+   */
+  async outcomes(): Promise<TaskOutcome[]> {
+    const now = Date.now();
+    if (this.outcomeCache && now - this.outcomeCacheAt < this.cfg.policy.cacheTtlMs) {
+      return this.outcomeCache;
+    }
+    try {
+      this.outcomeCache = await readTaskOutcomes();
+    } catch {
+      this.outcomeCache = [];
+    }
+    this.outcomeCacheAt = now;
+    return this.outcomeCache;
+  }
+
+  /** Per-model solved-rate table for the /jev-quality surface. */
+  async quality(): Promise<ModelQuality[]> {
+    return qualityByModel(await this.outcomes());
+  }
+
   async recentDecisions(limit = 10): Promise<unknown[]> {
     try {
       const page = await this.ctx?.storage?.scan?.({
@@ -317,6 +345,14 @@ export class PickerRuntime {
 
       // Annotate candidates with budget info for the picker backend
       for (const c of candidates) c.budget = budgetFor(snapshot, c.ref);
+
+      // Annotate with the measured outcome signal: which models have actually
+      // been observed failing on this stack. Read once per cache window - this
+      // opens the session DB, so it must not run on every pick.
+      const outcomes = await this.outcomes();
+      if (outcomes.length > 0) {
+        for (const c of candidates) c.flail = flailScore(outcomes, c.ref);
+      }
 
       // Partition by task fit (capacity-aware budget filtering)
       const { preferred, tight, tasksLeft: left } = partitionByTaskFit(

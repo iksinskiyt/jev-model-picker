@@ -5,9 +5,9 @@ import { registerSessionInterceptor } from "../src/sessions";
 import { resetPendingPicks } from "../src/hook";
 import { readBridge } from "../src/bridge";
 
-// Tests must never write to the user's live bridge state. bridgeDirectory()
-// honours this env var, so point every test run at a throwaway directory.
-process.env.JEV_MODEL_PICKER_STATE = process.env.JEV_TEST_STATE ?? ".jev-test-state";
+// JEV_MODEL_PICKER_STATE is set once, for every test file, by the preload in
+// test/setup.ts (registered in bunfig.toml). Assigning it here as well is what
+// made test files race over the bridge directory.
 
 /** Let the async event drain loop consume every queued event. */
 const drain = () => new Promise((r) => setTimeout(r, 20));
